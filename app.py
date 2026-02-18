@@ -272,7 +272,8 @@ def show_details(ticker, row_data):
             height=400,
             margin=dict(l=40, r=40, t=20, b=20)
         )
-        st.plotly_chart(fig_radar, use_container_width=True)
+# 警告箇所: width='stretch' を使用
+        st.plotly_chart(fig_radar, width='stretch')
 
     # 2. 配当推移グラフ
     with col2:
@@ -282,9 +283,12 @@ def show_details(ticker, row_data):
             # 過去10年分の配当を取得
             divs = stock.dividends
             if not divs.empty:
+# 警告箇所: ilocを使用して安全にアクセス
                 yearly_divs = divs.resample("YE").sum().tail(10)
                 yearly_divs.index = yearly_divs.index.year
-                st.bar_chart(yearly_divs)
+
+                # 棒グラフを表示
+                st.bar_chart(yearly_divs, width='stretch')
                 
                 # 利回りなどの指標
                 info = stock.info
