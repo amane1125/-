@@ -76,72 +76,81 @@ def get_ticker_master():
 def calculate_full_score_safe(ticker):
     stock = yf.Ticker(ticker)
     try:
-        # 1. データの取得
+        # 1. データの取得（API負荷を分散）
         inc = stock.income_stmt
-        time.sleep(1.0)
+        time.sleep(1.2)
         bal = stock.balance_sheet
-        time.sleep(1.0)
+        time.sleep(1.2)
         divs = stock.dividends
         
-        # 補助関数：複数のキーワード候補から一致するものを探す
+        # 補助関数：大文字小文字やスペースを無視して行を特定する
         def find_row(df, keywords):
             if df is None or df.empty: return pd.Series()
             for kw in keywords:
-                # スペースを消して小文字で比較する「超柔軟検索」
                 matches = [i for i in df.index if kw.lower().replace(" ", "") in i.lower().replace(" ", "")]
                 if matches:
                     return df.loc[matches[0]]
             return pd.Series()
 
-        # --- A. 財務データの抽出 (キーワード候補を複数指定) ---
-        # Net Income Common Stockholders なども拾えるように
+        # --- A. 配当計算 (空データ・IPO銘柄対策版) ---
+        growth_years = 0
+        d_cagr = 0
+        latest_div_sum = 0
+        confirmed_div = pd.Series()
+
+        if not divs.empty:
+            # 年間集計
+            yearly_div = divs.resample("YE").sum()
+            # IndexがDatetime型かつ'year'属性を持つかチェック (130A.T等のエラー対策)
+            if hasattr(yearly_div.index, 'year'):
+                current_year = datetime.now().year
+                confirmed_div = yearly_div[yearly_div.index.year < current_year]
+                
+                if not confirmed_div.empty:
+                    latest_div_sum = confirmed_div.iloc[-1]
+                    if len(confirmed_div) > 1:
+                        # 連続増配判定
+                        for i in range(1, len(confirmed_div)):
+                            if confirmed_div.iloc[-i] >= confirmed_div.iloc[-(i+1)]:
+                                growth_years += 1
+                            else:
+                                break
+                        # 配当CAGR
+                        d_cagr = cagr(confirmed_div)
+
+        # --- B. 財務データの抽出 (柔軟なキーワード検索) ---
         net_inc_series = find_row(inc, ["Net Income", "NetIncome"])
         rev_series = find_row(inc, ["Total Revenue", "Operating Revenue"])
         op_inc_series = find_row(inc, ["Operating Income", "OperatingProfit"])
         retained_series = find_row(bal, ["Retained Earnings"])
         cash_series = find_row(bal, ["Cash And Cash Equivalents", "CashAndCashEquivalents"])
 
-        # --- B. 配当計算 (2026年問題回避) ---
-        yearly_div = divs.resample("YE").sum() if not divs.empty else pd.Series()
-        current_year = datetime.now().year
-        confirmed_div = yearly_div[yearly_div.index.year < current_year]
-        
-        growth_years = 0
-        if len(confirmed_div) > 1:
-            for i in range(1, len(confirmed_div)):
-                if confirmed_div.iloc[-i] >= confirmed_div.iloc[-(i+1)]:
-                    growth_years += 1
-                else: break
-        
-        d_cagr = cagr(confirmed_div)
-
-        # --- C. 数値の算出 (自前計算優先) ---
-        # 株価取得
+        # --- C. 数値の算出 (自前計算を優先して info への依存を減らす) ---
+        # 1. 株価取得 (利回り計算用)
         hist = stock.history(period="1d")
         current_price = hist['Close'].iloc[-1] if not hist.empty else 0
         
-        # 営業利益率
+        # 2. 営業利益率
         op_margin = (op_inc_series.iloc[0] / rev_series.iloc[0] * 100) if not op_inc_series.empty and not rev_series.empty and rev_series.iloc[0] != 0 else 0
 
-        # 配当利回り
-        latest_div_sum = confirmed_div.iloc[-1] if not confirmed_div.empty else 0
+        # 3. 配当利回り (実績ベース)
         y_val = (latest_div_sum / current_price * 100) if current_price > 0 and latest_div_sum > 0 else 0
 
-        # 重い info は最後に1回だけ
+        # 4. 重い info データを最後に取得
         info = stock.info 
-        time.sleep(0.5)
+        time.sleep(0.8)
         
         roe = (info.get("returnOnEquity") or 0) * 100
         payout = (info.get("payoutRatio") or 0) * 100
         eps_cagr = cagr(net_inc_series[::-1])
         rev_cagr = cagr(rev_series[::-1])
 
-        # 配当維持
+        # 5. 配当維持可能年数
         retained = retained_series.iloc[0] if not retained_series.empty else 0
         shares = info.get("sharesOutstanding", 1)
         sustain = retained / (latest_div_sum * shares) if (latest_div_sum > 0 and shares > 0) else 0
 
-        # PER/割安性
+        # 6. PER/割安性 (CN-PER)
         mkt_cap = info.get("marketCap", 0)
         cash = cash_series.iloc[0] if not cash_series.empty else 0
         net_inc_val = net_inc_series.iloc[0] if not net_inc_series.empty else 0
@@ -161,14 +170,15 @@ def calculate_full_score_safe(ticker):
             "配当利回り": get_score(y_val, [(10, 5), (8, 4), (6, 3)])
         }
 
-        # デバッグ用：何が取れていないかコンソール（またはログ）に出す
+        # 全項目0点（取得全失敗）でなければ結果を返す
         if sum(scores.values()) == 0:
-             st.write(f"⚠️ {ticker}: 全データが0です。inc_len:{len(inc)}, bal_len:{len(bal)}, div_len:{len(divs)}")
+            return None, None
 
         return sum(scores.values()), scores
 
     except Exception as e:
-        st.write(f"❌ {ticker} エラー: {str(e)[:50]}")
+        # デバッグ用に最小限のログを出す
+        print(f"Error in {ticker}: {e}")
         return None, None
         
 # --- 6. UIメイン ---
