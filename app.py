@@ -76,65 +76,74 @@ def get_ticker_master():
 def calculate_full_score_safe(ticker):
     stock = yf.Ticker(ticker)
     try:
-        # 1. データの取得（失敗しても止まらないように個別にtry-exceptを入れるのが理想ですが、まずは一括で）
-        info = stock.info
-        time.sleep(1.5) # 負荷軽減
-        divs = stock.dividends
+        # 1. データ取得（順序を分散してブロックを回避）
         inc = stock.income_stmt
+        time.sleep(1.2)
         bal = stock.balance_sheet
+        time.sleep(1.2)
+        divs = stock.dividends
+        info = stock.info
+        
+        if inc.empty or bal.empty: 
+            return None, None
 
-        # 2. 空データへの耐性（Noneを返さず、空のDataFrameとして扱う）
-        if inc is None: inc = pd.DataFrame()
-        if bal is None: bal = pd.DataFrame()
+        # 補助関数：インデックス名が微妙に違ってもデータを取る
+        def find_row(df, keyword):
+            matches = [i for i in df.index if keyword.lower().replace(" ", "") in i.lower().replace(" ", "")]
+            return df.loc[matches[0]] if matches else pd.Series()
 
-        # --- A. 配当系 (divsが空でも計算を続行) ---
-        yearly_div = divs.resample("YE").sum() if (divs is not None and not divs.empty) else pd.Series()
+        # --- A. 配当計算のバグ修正版 ---
+        # 権利落ち日ベースで年単位に集計
+        yearly_div = divs.resample("YE").sum() if not divs.empty else pd.Series()
+        
+        # 【重要】2026年（現在）のデータは未確定なので、前年までの「確定データ」で判定する
+        current_year = datetime.now().year
+        confirmed_div = yearly_div[yearly_div.index.year < current_year]
+        
         growth_years = 0
-        if len(yearly_div) > 1:
-            for i in range(1, len(yearly_div)):
-                if yearly_div.iloc[-i] > yearly_div.iloc[-(i+1)]: growth_years += 1
-                else: break
+        if len(confirmed_div) > 1:
+            # 確定済みの最新年から過去へ遡って「減配していないか」をチェック
+            for i in range(1, len(confirmed_div)):
+                if confirmed_div.iloc[-i] >= confirmed_div.iloc[-(i+1)]:
+                    growth_years += 1
+                else:
+                    break
         
-        d_cagr = cagr(yearly_div)
-        payout = (info.get("payoutRatio") or 0) * 100
-        
-        # --- B. 収益系 (incが空ならcagrは0になる) ---
-        net_inc_series = inc.loc["Net Income"] if "Net Income" in inc.index else pd.Series()
-        eps_cagr = cagr(net_inc_series)
-        roe = (info.get("returnOnEquity") or 0) * 100
-        
-        # --- C. 財務健全性 (balが空ならsustainは0) ---
-        retained = 0
-        if not bal.empty and "Retained Earnings" in bal.index:
-            val = bal.loc["Retained Earnings"]
-            retained = val.iloc[0] if isinstance(val, pd.Series) else val.iloc[0,0]
-            
-        latest_div_ps = yearly_div.iloc[-1] if not yearly_div.empty else 0
-        shares = info.get("sharesOutstanding", 1)
-        sustain = retained / (latest_div_ps * shares) if latest_div_ps > 0 else 0
+        # CAGRも確定年ベースで算出（5年分）
+        d_cagr = cagr(confirmed_div)
 
-        # --- D. 割安性・利回り ---
-        rev_series = inc.loc["Total Revenue"] if "Total Revenue" in inc.index else pd.Series()
-        rev_cagr = cagr(rev_series)
+        # --- B. 業績・財務データの抽出 ---
+        net_inc_series = find_row(inc, "Net Income")
+        rev_series = find_row(inc, "Total Revenue")
+        retained_series = find_row(bal, "Retained Earnings")
+        cash_series = find_row(bal, "Cash And Cash Equivalents")
+
+        # 指標の計算
+        eps_cagr = cagr(net_inc_series[::-1]) # 時系列を古い順に反転
+        rev_cagr = cagr(rev_series[::-1])
+        roe = (info.get("returnOnEquity") or 0) * 100
         op_margin = (info.get("operatingMargins") or 0) * 100
-        
+        payout = (info.get("payoutRatio") or 0) * 100
+
+        # 配当維持可能年数
+        retained = retained_series.iloc[0] if not retained_series.empty else 0
+        # 最新の「年間」配当総額（株価詳細の配当金 × 発行済株式数）
+        latest_div_ps = confirmed_div.iloc[-1] if not confirmed_div.empty else 0
+        shares = info.get("sharesOutstanding", 1)
+        sustain = retained / (latest_div_ps * shares) if (latest_div_ps > 0 and shares > 0) else 0
+
+        # 割安性 (CN-PER)
         mkt_cap = info.get("marketCap", 0)
-        cash = 0
-        if not bal.empty and "Cash And Cash Equivalents" in bal.index:
-            c_val = bal.loc["Cash And Cash Equivalents"]
-            cash = c_val.iloc[0] if isinstance(c_val, pd.Series) else c_val.iloc[0,0]
-            
+        cash = cash_series.iloc[0] if not cash_series.empty else 0
         net_inc_val = net_inc_series.iloc[0] if not net_inc_series.empty else 0
         cn_per = (mkt_cap - cash) / net_inc_val if net_inc_val > 0 else 999
         
+        # 利回り (100%超えは異常値としてガード)
         raw_yield = info.get("dividendYield")
-        if raw_yield is not None:
-            y_val = raw_yield if raw_yield > 1.0 else raw_yield * 100
-            y_score = get_score(y_val, [(10, 5), (8, 4), (6, 3)]) if y_val < 100 else 0
-        else:
-            y_score = 0
+        y_val = (raw_yield if raw_yield > 1.0 else raw_yield * 100) if raw_yield else 0
+        yield_score = get_score(y_val, [(10, 5), (8, 4), (6, 3)]) if y_val < 100 else 0
 
-        # --- 3. スコアリング (データがない項目は自動的に0点になる) ---
+        # --- C. スコアリング ---
         scores = {
             "連続増配年数": get_score(growth_years, [(10, 10), (8, 5), (6, 3)]),
             "5年配当CAGR": get_score(d_cagr, [(10, 15), (8, 10), (6, 5)]),
@@ -145,18 +154,13 @@ def calculate_full_score_safe(ticker):
             "売上5年CAGR": get_score(rev_cagr, [(10, 10), (8, 5), (6, 3)]),
             "営業利益率": get_score(op_margin, [(10, 20), (8, 15), (6, 10)]),
             "CN-PER": get_score(30 - cn_per, [(10, 15), (8, 5), (6, 0)]),
-            "配当利回り": y_score
+            "配当利回り": yield_score
         }
-
-        # 重要：infoすら取れないような銘柄（完全にデータがないもの）だけ弾く
-        if not info:
-            return None, None
 
         return sum(scores.values()), scores
 
     except Exception as e:
-        # 何のエラーかログを出す
-        print(f"Error analyzing {ticker}: {e}")
+        print(f"Error in {ticker}: {e}")
         return None, None
         
 # --- 6. UIメイン ---
