@@ -285,47 +285,47 @@ def show_details(ticker, row_data):
                     
         # --- 2. 配当推移グラフ（Plotly版）の修正 ---
         # st.bar_chart ではなく Plotly を使うことで詳細な制御が可能になります
-        if not divs.empty:
-            yearly_divs = divs.resample("YE").sum().tail(10)
-            fig_div = go.Figure(data=[go.Bar(
-                x=yearly_divs.index.year, 
-                y=yearly_divs.values,
-                marker_color='#1f77b4',
-                hovertemplate='西暦: %{x}<br>配当金: %{y}円<extra></extra>' # チップをカスタマイズ
-            )])
-            fig_div.update_layout(
-                height=300,
-                margin=dict(l=20, r=20, t=20, b=20),
-                dragmode=False, # 移動禁止
-                xaxis=dict(fixedrange=True), # X軸のズーム禁止
-                yaxis=dict(fixedrange=True), # Y軸のズーム禁止
-            )
-            st.plotly_chart(
-                fig_div, 
-                width='stretch', 
-                config={'displayModeBar': False} # ツールバーを隠してスッキリさせる
-            )
-                
-                # 利回りの計算を厳格化 (700%などの異常値対策)
-                info = stock.info
-                raw_yield = info.get('dividendYield')
-                
-                if raw_yield is not None:
-                    # 1.0(100%)を超える場合は、すでに100掛けされていると判断して補正
-                    actual_yield = raw_yield if raw_yield < 1.0 else raw_yield / 100
-                    display_yield = actual_yield * 100
+            if not divs.empty:
+                yearly_divs = divs.resample("YE").sum().tail(10)
+                fig_div = go.Figure(data=[go.Bar(
+                    x=yearly_divs.index.year, 
+                    y=yearly_divs.values,
+                    marker_color='#1f77b4',
+                    hovertemplate='西暦: %{x}<br>配当金: %{y}円<extra></extra>' # チップをカスタマイズ
+                )])
+                fig_div.update_layout(
+                    height=300,
+                    margin=dict(l=20, r=20, t=20, b=20),
+                    dragmode=False, # 移動禁止
+                    xaxis=dict(fixedrange=True), # X軸のズーム禁止
+                    yaxis=dict(fixedrange=True), # Y軸のズーム禁止
+                )
+                st.plotly_chart(
+                    fig_div, 
+                    width='stretch', 
+                    config={'displayModeBar': False} # ツールバーを隠してスッキリさせる
+                )
                     
-                    # 万が一、補正後も30%を超えるようなら「異常値」として警告表示
-                    if display_yield > 30:
-                        st.metric("予想配当利回り", "データ異常", delta=f"{display_yield:.1f}% ?", delta_color="inverse")
+                    # 利回りの計算を厳格化 (700%などの異常値対策)
+                    info = stock.info
+                    raw_yield = info.get('dividendYield')
+                    
+                    if raw_yield is not None:
+                        # 1.0(100%)を超える場合は、すでに100掛けされていると判断して補正
+                        actual_yield = raw_yield if raw_yield < 1.0 else raw_yield / 100
+                        display_yield = actual_yield * 100
+                        
+                        # 万が一、補正後も30%を超えるようなら「異常値」として警告表示
+                        if display_yield > 30:
+                            st.metric("予想配当利回り", "データ異常", delta=f"{display_yield:.1f}% ?", delta_color="inverse")
+                        else:
+                            st.metric("予想配当利回り", f"{display_yield:.2f} %")
                     else:
-                        st.metric("予想配当利回り", f"{display_yield:.2f} %")
+                        st.metric("予想配当利回り", "--- %")
                 else:
-                    st.metric("予想配当利回り", "--- %")
-            else:
-                st.info("配当データが見つかりませんでした。")
-        except:
-            st.error("データの取得に失敗しました。")
+                    st.info("配当データが見つかりませんでした。")
+            except:
+                st.error("データの取得に失敗しました。")
 
     # 3. 指標データ
     st.write("📝 評価指標スコア詳細")
