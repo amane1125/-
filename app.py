@@ -9,6 +9,7 @@ import time
 import urllib.request
 import plotly.graph_objects as go
 from datetime import datetime
+from collections import OrderedDict
 
 # --- 基本設定 ---
 st.set_page_config(page_title="Dividend Growth 100 RT", layout="wide")
@@ -75,93 +76,80 @@ def get_ticker_master():
 # --- 5. 10項目評価ロジック（401/429対策 & 2026年仕様） ---
 def calculate_full_score_safe(ticker):
     stock = yf.Ticker(ticker)
+    # 評価項目の順番を完全に固定
+    fixed_keys = [
+        "連続増配年数", "5年配当CAGR", "純利益5年CAGR", "売上5年CAGR",
+        "ROE", "営業利益率", "配当利回り", "予想配当性向"
+    ]
+    
     try:
-        # 1. データの取得（リトライ付き）
+        # 1. データの取得
         info = stock.info
         time.sleep(1.2)
-        
         inc = stock.income_stmt
-        if inc is None or inc.empty:
-            inc = stock.quarterly_income_stmt
-        
+        if inc is None or inc.empty: inc = stock.quarterly_income_stmt
         divs = stock.dividends
         time.sleep(1.0)
 
-        # 補助関数：時系列データを正しく「古い順」に整列させて取得
-        def get_time_series(df, keywords):
+        # 補助関数：時系列データを必ず「古い順」に整列
+        def get_clean_ts(df, keywords):
             if df is None or df.empty: return pd.Series()
             for kw in keywords:
                 matches = [i for i in df.index if kw.lower().replace(" ", "") in i.lower().replace(" ", "")]
                 if matches:
                     series = df.loc[matches[0]]
                     if isinstance(series, pd.DataFrame): series = series.iloc[0]
-                    # 日付インデックスを昇順（古い順）に並び替え
-                    return series.sort_index(ascending=True)
+                    # インデックス（日付）を古い順にソート
+                    return series.sort_index(ascending=True).dropna()
             return pd.Series()
 
-        # --- A. 時系列指標の抽出 (円グラフ左側) ---
-        net_inc_ts = get_time_series(inc, ["Net Income", "Controlling Interests"])
-        rev_ts = get_time_series(inc, ["Total Revenue", "Net Sales", "Operating Revenue"])
+        # --- A. 時系列指標 (CAGR・増配) ---
+        net_inc_ts = get_clean_ts(inc, ["Net Income", "Controlling Interests"])
+        rev_ts = get_clean_ts(inc, ["Total Revenue", "Net Sales"])
         
-        # 成長率の計算 (cagr関数に渡す前にNoneチェック)
-        eps_cagr_val = cagr(net_inc_ts) if not net_inc_ts.empty else 0
-        rev_cagr_val = cagr(rev_ts) if not rev_ts.empty else 0
-
-        # --- B. 配当関連 (円グラフ左上) ---
+        # 配当データの処理
         growth_years = 0
         d_cagr_val = 0
         latest_div_sum = 0
-        
         if not divs.empty:
-            # 配当も古い順に並び替え
-            divs = divs.sort_index(ascending=True)
-            yearly_div = divs.resample("YE").sum()
-            confirmed_div = yearly_div[yearly_div.index.year < 2026]
-            
+            yearly_div = divs.sort_index(ascending=True).resample("YE").sum()
+            confirmed_div = yearly_div[yearly_div.index.year < 2026] # 2026年問題回避
             if not confirmed_div.empty:
                 latest_div_sum = confirmed_div.iloc[-1]
                 if len(confirmed_div) > 1:
-                    # 連続増配カウント
+                    # 連続増配カウント（最新から遡る）
                     for i in range(1, len(confirmed_div)):
-                        if confirmed_div.iloc[-i] >= confirmed_div.iloc[-(i+1)]:
-                            growth_years += 1
+                        if confirmed_div.iloc[-i] >= confirmed_div.iloc[-(i+1)]: growth_years += 1
                         else: break
                     d_cagr_val = cagr(confirmed_div)
 
-        # --- C. 収益性・利回り (円グラフ右側) ---
+        # --- B. 単一指標 (ROE・利回り等) ---
         hist = stock.history(period="1d")
         current_price = hist['Close'].iloc[-1] if not hist.empty else 1
         
-        # 営業利益率
-        op_margin = (info.get("operatingMargins") or 0) * 100
-        if op_margin == 0:
-            op_inc = get_time_series(inc, ["Operating Income", "Operating Profit"]).iloc[-1] if not inc.empty else 0
-            rev_val = rev_ts.iloc[-1] if not rev_ts.empty else 0
-            op_margin = (op_inc / rev_val * 100) if rev_val != 0 else 0
-
-        # 利回り
-        y_val = (latest_div_sum / current_price * 100) if latest_div_sum > 0 else (info.get("dividendYield", 0) * 100)
-        
-        # ROE
         roe = (info.get("returnOnEquity") or 0) * 100
+        op_margin = (info.get("operatingMargins") or 0) * 100
+        y_val = (latest_div_sum / current_price * 100) if latest_div_sum > 0 else (info.get("dividendYield", 0) * 100)
+        payout = (info.get("payoutRatio") or 0) * 100
 
-        # --- D. スコアリング ---
-        scores = {
-            "連続増配年数": get_score(growth_years, [(10, 10), (8, 5), (6, 3)]),
-            "5年配当CAGR": get_score(d_cagr_val, [(10, 15), (8, 10), (6, 5)]),
-            "純利益5年CAGR": get_score(eps_cagr_val, [(10, 15), (8, 10), (6, 5)]),
-            "売上5年CAGR": get_score(rev_cagr_val, [(10, 10), (8, 5), (6, 3)]),
-            "ROE": get_score(roe, [(10, 20), (8, 15), (6, 10)]),
-            "営業利益率": get_score(op_margin, [(10, 20), (8, 15), (6, 10)]),
-            "配当利回り": get_score(y_val, [(10, 5), (8, 4), (6, 3)]),
-            "予想配当性向": get_score(60 - (info.get("payoutRatio", 0)*100), [(10, 20), (8, 10), (6, 0)])
-        }
+        # --- C. スコア計算 (順番を固定した辞書を作成) ---
+        scores = OrderedDict()
+        # 順番を fixed_keys と完全に一致させる
+        scores["連続増配年数"] = get_score(growth_years, [(10, 10), (8, 5), (6, 3)])
+        scores["5年配当CAGR"] = get_score(d_cagr_val, [(10, 15), (8, 10), (6, 5)])
+        scores["純利益5年CAGR"] = get_score(cagr(net_inc_ts), [(10, 15), (8, 10), (6, 5)])
+        scores["売上5年CAGR"] = get_score(cagr(rev_ts), [(10, 10), (8, 5), (6, 3)])
+        scores["ROE"] = get_score(roe, [(10, 20), (8, 15), (6, 10)])
+        scores["営業利益率"] = get_score(op_margin, [(10, 20), (8, 15), (6, 10)])
+        scores["配当利回り"] = get_score(y_val, [(10, 5), (8, 4), (6, 3)])
+        scores["予想配当性向"] = get_score(60 - payout, [(10, 20), (8, 10), (6, 0)])
 
         return sum(scores.values()), scores
 
     except Exception as e:
-        print(f"Error logic: {e}")
-        return None, None
+        # エラー時は項目名だけ持った0点辞書を返す（グラフ崩れ防止）
+        empty_scores = OrderedDict({k: 0 for k in fixed_keys})
+        return 0, empty_scores
         
 # --- 6. UIメイン ---
 init_db()
