@@ -5,3 +5,4 @@ numpy
 plotly
 requests
 xlrd
+curl_cffi
