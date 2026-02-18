@@ -9,129 +9,162 @@ import os
 import plotly.graph_objects as go
 from datetime import datetime
 
-# --- 設定 ---
+# --- 基本設定 ---
 st.set_page_config(page_title="Dividend Growth 100 RT", layout="wide")
 st.title("🇯🇵 Dividend Growth 100 (準リアルタイム)")
+st.write("財務スコア（DB）と最新株価（リアルタイム）を融合して評価します")
 
 DB_PATH = "stock_data.db"
 JPX_FILE = "jpx_list.xls"
 
-# --- データベース初期化 ---
+# --- 1. データベース初期化 ---
 def init_db():
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute('''CREATE TABLE IF NOT EXISTS stocks (
             ticker TEXT PRIMARY KEY,
             total_score INTEGER,
             score_json TEXT,
-            dividend_yield REAL,
             last_update TIMESTAMP
         )''')
 
-# --- JPXリスト取得 ---
+# --- 2. JPXマスターデータ取得 (銘柄名・業種対応) ---
 @st.cache_data
-def get_all_tickers():
+def get_ticker_master():
     if not os.path.exists(JPX_FILE):
         url = "https://www.jpx.co.jp/markets/statistics-equities/misc/tvdivq0000001vg2-att/data_j.xls"
         urllib.request.urlretrieve(url, JPX_FILE)
-    df = pd.read_excel(JPX_FILE)
-    df = df[df["市場・商品区分"].str.contains("内国株式", na=False)]
-    return (df["コード"].astype(str) + ".T").tolist()
+    
+    # xlrdがインストールされている必要があります
+    try:
+        df = pd.read_excel(JPX_FILE)
+    except ImportError:
+        st.error("ライブラリ 'xlrd' が足りません。 pip install xlrd を実行してください。")
+        return {}
 
-# --- 財務スコア計算（重い処理） ---
+    df = df[df["市場・商品区分"].str.contains("内国株式", na=False)]
+    
+    master = {}
+    for _, row in df.iterrows():
+        ticker = str(row["コード"]) + ".T"
+        master[ticker] = {
+            "name": row["銘柄名"],
+            "sector": row["33業種区分"]
+        }
+    return master
+
+# --- 3. 財務スコア計算ロジック (重い処理) ---
 def calculate_fundamental_score(ticker):
     try:
         stock = yf.Ticker(ticker)
-        # 財務データのみ取得（infoは最小限に）
-        income = stock.income_stmt
+        # 連続増配年数の計算（過去の配当データを使用）
         dividends = stock.dividends
-        balance = stock.balance_sheet
-        
-        # 連続増配年数
         yearly_div = dividends.resample("YE").sum() if not dividends.empty else pd.Series()
+        
         growth_years = 0
         if len(yearly_div) > 1:
             for i in range(1, len(yearly_div)):
                 if yearly_div.iloc[i] > yearly_div.iloc[i-1]: growth_years += 1
         
-        # スコアリングロジック（簡略化して安定性を向上）
+        # サンプルスコアリング（他の財務指標もここに追加可能）
         s_growth = 10 if growth_years >= 10 else (8 if growth_years >= 5 else 6)
-        
-        scores = {"連続増配": s_growth} # 他の指標も同様に追加可能
+        scores = {"連続増配年数": s_growth}
         total = sum(scores.values())
         
         return total, scores
     except:
         return None, None
 
-# --- 更新処理（スレッド用） ---
-def update_ticker(ticker):
+def update_ticker_in_db(ticker):
     total, scores = calculate_fundamental_score(ticker)
     if total is not None:
         with sqlite3.connect(DB_PATH) as conn:
             conn.execute("INSERT OR REPLACE INTO stocks (ticker, total_score, score_json, last_update) VALUES (?, ?, ?, ?)",
                          (ticker, total, json.dumps(scores), datetime.now()))
 
-# --- メインUI ---
+# --- 4. メイン処理準備 ---
 init_db()
-all_tickers = get_all_tickers()
+master_data = get_ticker_master()
+all_tickers = list(master_data.keys())
 
-# サイドバー：データ管理
+# サイドバー：DB更新用
 with st.sidebar:
-    st.header("⚙️ データ管理")
-    if st.button("未取得銘柄をスキャン (初回・更新)"):
+    st.header("⚙️ データ更新")
+    st.write("新しい銘柄の財務データをDBに保存します。")
+    if st.button("未取得銘柄をスキャン (20件ずつ)"):
         with sqlite3.connect(DB_PATH) as conn:
             exist = pd.read_sql("SELECT ticker FROM stocks", conn)['ticker'].tolist()
-        new_tickers = list(set(all_tickers) - set(exist))[:20] # 一回のスキャン数を制限してBAN防止
+        new_tickers = list(set(all_tickers) - set(exist))[:20]
         
         if new_tickers:
-            with st.spinner(f"{len(new_tickers)}件取得中..."):
-                with ThreadPoolExecutor(max_workers=2) as executor:
-                    list(executor.map(update_ticker, new_tickers))
-            st.success("更新完了！")
+            progress_bar = st.progress(0)
+            for i, t in enumerate(new_tickers):
+                update_ticker_in_db(t)
+                progress_bar.progress((i + 1) / len(new_tickers))
+            st.success(f"{len(new_tickers)}件更新しました。")
+            st.rerun()
         else:
-            st.info("全ての銘柄がDBに存在します")
+            st.info("全ての銘柄が登録済みです。")
 
-# --- 準リアルタイム・ランキング表示（Fragment機能） ---
-@st.fragment(run_every=300) # 5分ごとに自動更新
-def show_ranking():
-    st.header("📊 準リアルタイム・ランキング")
+# --- 5. 準リアルタイム・ランキング表示 (5分自動更新) ---
+@st.fragment(run_every=300)
+def show_ranking_board():
+    st.header("📊 スコアランキング (TOP 50)")
+    
     with sqlite3.connect(DB_PATH) as conn:
         df = pd.read_sql("SELECT ticker, total_score FROM stocks", conn)
     
     if not df.empty:
-        # 上位50件を抽出
-        top_df = df.sort_values("total_score", ascending=False).head(50)
+        # スコア順に並び替え
+        top_df = df.sort_values("total_score", ascending=False).head(50).copy()
+        
+        # 銘柄名と業種をマッピング
+        top_df['銘柄名'] = top_df['ticker'].apply(lambda x: master_data.get(x, {}).get('name', '不明'))
+        top_df['業種'] = top_df['ticker'].apply(lambda x: master_data.get(x, {}).get('sector', '不明'))
+        
         top_tickers = top_df['ticker'].tolist()
         
         try:
-            # 【重要】株価データのみを一括で高速ダウンロード
+            # 最新株価を「一括」で取得 (爆速 & BAN対策)
             prices = yf.download(top_tickers, period="1d", interval="1m", progress=False)['Close'].iloc[-1]
-            
             top_df['現在値'] = top_df['ticker'].map(prices).round(1)
-            # 簡易的な前日比（もし取得できれば）
-            st.dataframe(top_df[['ticker', 'total_score', '現在値']], use_container_width=True)
-            st.caption(f"最終更新: {datetime.now().strftime('%H:%M:%S')} (5分ごとに自動更新)")
-        except Exception as e:
-            st.warning("株価のリアルタイム取得に失敗しました。DBのデータを表示します。")
-            st.dataframe(top_df)
+            
+            # カラムを整理して表示
+            display_cols = ['total_score', '銘柄名', '業種', '現在値', 'ticker']
+            st.dataframe(
+                top_df[display_cols].rename(columns={'total_score': '総合点', 'ticker': 'コード'}), 
+                use_container_width=True, 
+                hide_index=True
+            )
+            st.caption(f"最終更新時刻: {datetime.now().strftime('%H:%M:%S')} (5分おきに自動更新中)")
+        except:
+            st.warning("リアルタイム株価の取得に失敗しました。DBデータのみ表示します。")
+            st.dataframe(top_df[['total_score', '銘柄名', '業種', 'ticker']], hide_index=True)
     else:
-        st.info("サイドバーから『スキャン』を実行してデータを蓄積してください。")
+        st.info("左側のスキャンボタンを押して、まずDBにデータを溜めてください。")
 
-show_ranking()
+show_ranking_board()
 
-# --- 個別銘柄分析 ---
-st.header("🔎 個別銘柄分析")
-code = st.text_input("銘柄コードを入力 (例: 9432)")
-if code:
-    ticker = code if code.endswith(".T") else code + ".T"
-    with st.spinner("詳細データを取得中..."):
-        # 詳細分析は個別にTicker.infoを叩く
-        s = yf.Ticker(ticker)
-        st.subheader(f"{s.info.get('longName', ticker)}")
-        col1, col2 = st.columns(2)
-        col1.metric("現在値", f"¥{s.fast_info.get('last_price', 0):.1f}")
-        col1.metric("配当利回り", f"{s.info.get('dividendYield', 0)*100:.2f}%")
+# --- 6. 個別銘柄検索 ---
+st.divider()
+st.header("🔎 個別詳細分析")
+search_code = st.text_input("銘柄コードを入力してください (例: 9432)")
+
+if search_code:
+    t_code = search_code if search_code.endswith(".T") else search_code + ".T"
+    if t_code in master_data:
+        st.subheader(f"{master_data[t_code]['name']} ({master_data[t_code]['sector']})")
         
-        # 簡易チャート
-        hist = s.history(period="1mo")
-        st.line_chart(hist['Close'])
+        with st.spinner("詳細データを取得中..."):
+            s = yf.Ticker(t_code)
+            col1, col2, col3 = st.columns(3)
+            col1.metric("現在値", f"¥{s.fast_info.get('last_price', 0):.1f}")
+            # info取得は慎重に (個別ページのみ実行)
+            info = s.info
+            col2.metric("配当利回り", f"{info.get('dividendYield', 0)*100:.2f}%")
+            col3.metric("PER", f"{info.get('trailingPE', 0):.1f}倍")
+            
+            # 直近1ヶ月のチャート
+            hist = s.history(period="1mo")
+            st.line_chart(hist['Close'])
+    else:
+        st.error("有効な銘柄コードではありません。")
