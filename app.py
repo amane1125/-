@@ -48,7 +48,7 @@ def cagr(series):
 def get_score(value, thresholds):
     for s, t in thresholds:
         if value >= t: return s
-    return 2
+    return 0
 
 # --- 3. データベース初期化 ---
 def init_db():
