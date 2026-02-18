@@ -78,36 +78,42 @@ def get_ticker_master():
 # --- 5. 10項目評価ロジック（401/429対策 & 2026年仕様） ---
 def calculate_full_score_safe(ticker):
     stock = yf.Ticker(ticker)
-    # 円グラフの軸を固定するための定義
+    # 円グラフの軸と表示順を完全に固定
     fixed_keys = [
         "連続増配年数", "5年配当CAGR", "純利益5年CAGR", "売上5年CAGR",
         "ROE", "営業利益率", "配当利回り", "予想配当性向"
     ]
     
     try:
-        # 1. データの取得
+        # 1. データの取得（待機時間を入れてAPI制限を回避）
         info = stock.info
         time.sleep(1.2)
         inc = stock.income_stmt
-        if inc is None or inc.empty: inc = stock.quarterly_income_stmt
+        if inc is None or inc.empty: 
+            inc = stock.quarterly_income_stmt
         
+        bal = stock.balance_sheet
+        if bal is None or bal.empty:
+            bal = stock.quarterly_balance_sheet
+            
         divs = stock.dividends
-        splits = stock.splits  # 株式分割履歴
+        splits = stock.splits
         time.sleep(1.0)
 
-        # 補助関数：時系列データを「古い順」に整列して取得
+        # 補助関数：日本株特有の項目名揺れに対応し、古い順にソートして取得
         def get_clean_ts(df, keywords):
             if df is None or df.empty: return pd.Series()
             for kw in keywords:
+                # 大文字小文字・空白を無視してマッチング
                 matches = [i for i in df.index if kw.lower().replace(" ", "") in i.lower().replace(" ", "")]
                 if matches:
                     series = df.loc[matches[0]]
                     if isinstance(series, pd.DataFrame): series = series.iloc[0]
-                    # ★重要：インデックスを昇順（古い順）にソート
+                    # 日付を古い順（昇順）に並び替え、欠損値を除く
                     return series.sort_index(ascending=True).dropna()
             return pd.Series()
 
-        # --- A. 時系列データの抽出 (CAGR用) ---
+        # --- A. 時系列データの抽出 (CAGR・増配判定用) ---
         net_inc_ts = get_clean_ts(inc, ["Net Income", "Controlling Interests", "NetIncome"])
         rev_ts = get_clean_ts(inc, ["Total Revenue", "Net Sales", "Operating Revenue"])
         
@@ -115,53 +121,51 @@ def calculate_full_score_safe(ticker):
         growth_years = 0
         d_cagr_val = 0
         latest_div_sum = 0
-        
         if not divs.empty:
-            # 配当を年単位・昇順で整理
             yearly_div = divs.sort_index(ascending=True).resample("YE").sum()
-            # ★重要：2026年以降の未確定データを除外
-            confirmed_div = yearly_div[yearly_div.index.year < 2026]
+            confirmed_div = yearly_div[yearly_div.index.year < 2026] # 2026年(今年)の端数を除外
             
             if not confirmed_div.empty:
                 latest_div_sum = confirmed_div.iloc[-1]
-                
-                # ★重要：株式分割による配当額の補正（日本アクア対策）
+                # 株式分割の補正（日本アクア等の異常値対策）
                 if not splits.empty:
                     last_split_date = splits.index[-1]
                     if confirmed_div.index[-1] < last_split_date:
-                        # 最後の配当が分割前なら、分割比率で割って現在の株価に合わせる
                         latest_div_sum = latest_div_sum / splits.iloc[-1]
 
-                # 連続増配判定
                 if len(confirmed_div) > 1:
+                    # 最新年から遡って連続増配をカウント
                     for i in range(1, len(confirmed_div)):
                         if confirmed_div.iloc[-i] >= confirmed_div.iloc[-(i+1)]:
                             growth_years += 1
                         else: break
                     d_cagr_val = cagr(confirmed_div)
 
-        # --- B. 単一指標の算出 ---
+        # --- B. 単一指標の算出 (営業利益率・利回りの復活) ---
         hist = stock.history(period="1d")
         current_price = hist['Close'].iloc[-1] if not hist.empty else 1
         
-        # 営業利益率 (info優先、なければ算出)
+        # 1. 営業利益率：infoが空なら損益計算書から自前計算
         op_margin = (info.get("operatingMargins") or 0) * 100
         if op_margin == 0 and not inc.empty:
-            op_inc = get_clean_ts(inc, ["Operating Income", "Operating Profit", "OperatingProfit"]).iloc[-1]
-            rev_val = rev_ts.iloc[-1] if not rev_ts.empty else 0
-            op_margin = (op_inc / rev_val * 100) if rev_val != 0 else 0
+            op_inc_ts = get_clean_ts(inc, ["Operating Income", "Operating Profit", "OperatingProfit"])
+            if not op_inc_ts.empty and not rev_ts.empty:
+                op_margin = (op_inc_ts.iloc[-1] / rev_ts.iloc[-1] * 100) if rev_ts.iloc[-1] != 0 else 0
 
-        # 利回り (実績ベースを再計算)
+        # 2. 配当利回り：実績ベースを優先的に算出
         y_val = (latest_div_sum / current_price * 100) if (latest_div_sum > 0 and current_price > 0) else (info.get("dividendYield", 0) * 100)
         
-        # ROE (info優先、なければ自前計算)
+        # 3. ROE：infoが空なら自前計算
         roe = (info.get("returnOnEquity") or 0) * 100
-        if roe == 0 and not net_inc_ts.empty:
-            bal = stock.balance_sheet
-            equity = get_clean_ts(bal, ["Stockholders Equity", "Total Equity"]).iloc[-1]
-            roe = (net_inc_ts.iloc[-1] / equity * 100) if equity != 0 else 0
+        if roe == 0 and not net_inc_ts.empty and not bal.empty:
+            equity_ts = get_clean_ts(bal, ["Stockholders Equity", "Total Equity", "Common Stock Equity"])
+            if not equity_ts.empty:
+                roe = (net_inc_ts.iloc[-1] / equity_ts.iloc[-1] * 100) if equity_ts.iloc[-1] != 0 else 0
+        
+        # 4. 配当性向
+        payout = (info.get("payoutRatio") or 0) * 100
 
-        # --- C. スコアリング (OrderedDictで順番を固定) ---
+        # --- C. スコアリング (OrderedDictで円グラフの順番を固定) ---
         scores = OrderedDict()
         scores["連続増配年数"] = get_score(growth_years, [(10, 10), (8, 5), (6, 3)])
         scores["5年配当CAGR"] = get_score(d_cagr_val, [(10, 15), (8, 10), (6, 5)])
@@ -170,11 +174,13 @@ def calculate_full_score_safe(ticker):
         scores["ROE"] = get_score(roe, [(10, 20), (8, 15), (6, 10)])
         scores["営業利益率"] = get_score(op_margin, [(10, 20), (8, 15), (6, 10)])
         scores["配当利回り"] = get_score(y_val, [(10, 5), (8, 4), (6, 3)])
-        scores["予想配当性向"] = get_score(60 - (info.get("payoutRatio", 0) * 100), [(10, 20), (8, 10), (6, 0)])
+        scores["予想配当性向"] = get_score(60 - payout, [(10, 20), (8, 10), (6, 0)])
 
         return sum(scores.values()), scores
 
     except Exception as e:
+        print(f"Error analyzing {ticker}: {e}")
+        # エラー時もグラフが壊れないよう0点の固定辞書を返す
         return 0, OrderedDict({k: 0 for k in fixed_keys})
         
 # --- 6. UIメイン ---
