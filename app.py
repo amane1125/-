@@ -207,7 +207,7 @@ with st.sidebar:
 
 @st.fragment(run_every=300)
 def ranking_board():
-    st.header("📊 スコアランキング (TOP 50)")
+    st.header("📊 総合スコアランキング (TOP 50)")
     with sqlite3.connect(DB_PATH) as conn:
         df = pd.read_sql("SELECT * FROM stocks", conn)
     
@@ -217,18 +217,86 @@ def ranking_board():
         df['業種'] = df['ticker'].apply(lambda x: master.get(x, {}).get('sector', '不明'))
         
         try:
-            session = get_verified_session()
+            # 最新株価をバルク取得
             prices_data = yf.download(df['ticker'].tolist(), period="1d", progress=False)
             prices = prices_data['Close'].iloc[-1]
             df['現在値'] = df['ticker'].map(prices).round(1)
             
-            # 2026年仕様: width='stretch'
-            st.dataframe(df[['total_score', '銘柄名', '業種', '現在値', 'ticker']].rename(columns={'total_score':'点数'}), width='stretch', hide_index=True)
-        except:
-            st.dataframe(df[['total_score', '銘柄名', '業種', 'ticker']], width='stretch', hide_index=True)
+            # 2026年仕様: 選択機能を有効にしたテーブル
+            display_df = df[['total_score', '銘柄名', '業種', '現在値', 'ticker']].rename(columns={'total_score':'点数'})
+            
+            event = st.dataframe(
+                display_df,
+                width='stretch',
+                hide_index=True,
+                on_select="rerun", # 選択時にリロードして下の詳細を表示
+                selection_mode="single_row" # 1件ずつ選択
+            )
+            
+            # 銘柄が選択された場合の詳細表示
+            if event.selection.rows:
+                selected_idx = event.selection.rows[0]
+                selected_ticker = display_df.iloc[selected_idx]['ticker']
+                show_details(selected_ticker, df[df['ticker'] == selected_ticker].iloc[0])
+
+        except Exception as e:
+            st.error(f"表示エラー: {e}")
     else:
-        st.info("サイドバーからスキャンしてください")
+        st.info("サイドバーのスキャンを実行してデータを蓄積してください。")
 
+# --- 詳細表示用関数 ---
+def show_details(ticker, row_data):
+    st.divider()
+    name = master.get(ticker, {}).get('name', '不明')
+    sector = master.get(ticker, {}).get('sector', '不明')
+    st.subheader(f"🔍 {name} ({ticker}) の詳細分析")
+    
+    col1, col2 = st.columns([1, 1])
+    
+    # 1. レーダーチャート (点数配分)
+    with col1:
+        st.write("📈 指標別スコア")
+        scores = json.loads(row_data['score_json'])
+        categories = list(scores.keys())
+        values = list(scores.values())
+        
+        fig_radar = go.Figure(data=go.Scatterpolar(
+            r=values + [values[0]],
+            theta=categories + [categories[0]],
+            fill='toself',
+            line_color='#1f77b4'
+        ))
+        fig_radar.update_layout(
+            polar=dict(radialaxis=dict(visible=True, range=[0, 10])),
+            showlegend=False,
+            height=400,
+            margin=dict(l=40, r=40, t=20, b=20)
+        )
+        st.plotly_chart(fig_radar, use_container_width=True)
+
+    # 2. 配当推移グラフ
+    with col2:
+        st.write("💰 配当金の推移 (年単位)")
+        try:
+            stock = yf.Ticker(ticker)
+            # 過去10年分の配当を取得
+            divs = stock.dividends
+            if not divs.empty:
+                yearly_divs = divs.resample("YE").sum().tail(10)
+                yearly_divs.index = yearly_divs.index.year
+                st.bar_chart(yearly_divs)
+                
+                # 利回りなどの指標
+                info = stock.info
+                st.metric("予想配当利回り", f"{info.get('dividendYield', 0)*100:.2f} %")
+            else:
+                st.info("配当データが見つかりませんでした。")
+        except:
+            st.error("配当データの取得に失敗しました。")
+
+    # 3. 指標データテーブル
+    st.write("📝 評価指標データ")
+    st.table(pd.DataFrame(scores.items(), columns=["評価項目", "獲得点数 (10点満点)"]))
+
+# --- 最後にこれを呼び出す ---
 ranking_board()
-
-# 個別分析部分は前回同様のため省略可能ですが、必要なら追加してください。
