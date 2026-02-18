@@ -75,7 +75,7 @@ def get_ticker_master():
 # --- 5. 10項目評価ロジック（401/429対策 & 2026年仕様） ---
 def calculate_full_score_safe(ticker):
     session = get_verified_session()
-    stock = yf.Ticker(ticker, session=session)
+    stock = yf.Ticker(ticker)
     
     try:
         # APIリクエスト間に「溜め」を作る
@@ -176,7 +176,7 @@ def ranking_board():
         
         try:
             session = get_verified_session()
-            prices_data = yf.download(df['ticker'].tolist(), period="1d", session=session, progress=False)
+            prices_data = yf.download(df['ticker'].tolist(), period="1d", progress=False)
             prices = prices_data['Close'].iloc[-1]
             df['現在値'] = df['ticker'].map(prices).round(1)
             
