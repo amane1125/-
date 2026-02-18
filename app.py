@@ -230,7 +230,7 @@ def ranking_board():
                 width='stretch',
                 hide_index=True,
                 on_select="rerun", # 選択時にリロードして下の詳細を表示
-                selection_mode="single_row" # 1件ずつ選択
+                selection_mode="single-row" # 1件ずつ選択
             )
             
             # 銘柄が選択された場合の詳細表示
