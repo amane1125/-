@@ -282,32 +282,29 @@ def show_details(ticker, row_data):
         try:
             stock = yf.Ticker(ticker)
             divs = stock.dividends
-            if not divs.empty:
-                yearly_divs = divs.resample("YE").sum().tail(10)
-                yearly_divs.index = yearly_divs.index.year
-                
-    # --- 2. 配当推移グラフ（Plotly版）の修正 ---
-    # st.bar_chart ではなく Plotly を使うことで詳細な制御が可能になります
-    if not divs.empty:
-        yearly_divs = divs.resample("YE").sum().tail(10)
-        fig_div = go.Figure(data=[go.Bar(
-            x=yearly_divs.index.year, 
-            y=yearly_divs.values,
-            marker_color='#1f77b4',
-            hovertemplate='西暦: %{x}<br>配当金: %{y}円<extra></extra>' # チップをカスタマイズ
-        )])
-        fig_div.update_layout(
-            height=300,
-            margin=dict(l=20, r=20, t=20, b=20),
-            dragmode=False, # 移動禁止
-            xaxis=dict(fixedrange=True), # X軸のズーム禁止
-            yaxis=dict(fixedrange=True), # Y軸のズーム禁止
-        )
-        st.plotly_chart(
-            fig_div, 
-            width='stretch', 
-            config={'displayModeBar': False} # ツールバーを隠してスッキリさせる
-        )
+                    
+        # --- 2. 配当推移グラフ（Plotly版）の修正 ---
+        # st.bar_chart ではなく Plotly を使うことで詳細な制御が可能になります
+        if not divs.empty:
+            yearly_divs = divs.resample("YE").sum().tail(10)
+            fig_div = go.Figure(data=[go.Bar(
+                x=yearly_divs.index.year, 
+                y=yearly_divs.values,
+                marker_color='#1f77b4',
+                hovertemplate='西暦: %{x}<br>配当金: %{y}円<extra></extra>' # チップをカスタマイズ
+            )])
+            fig_div.update_layout(
+                height=300,
+                margin=dict(l=20, r=20, t=20, b=20),
+                dragmode=False, # 移動禁止
+                xaxis=dict(fixedrange=True), # X軸のズーム禁止
+                yaxis=dict(fixedrange=True), # Y軸のズーム禁止
+            )
+            st.plotly_chart(
+                fig_div, 
+                width='stretch', 
+                config={'displayModeBar': False} # ツールバーを隠してスッキリさせる
+            )
                 
                 # 利回りの計算を厳格化 (700%などの異常値対策)
                 info = stock.info
