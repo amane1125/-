@@ -147,21 +147,63 @@ def calculate_full_score_safe(ticker):
 init_db()
 master = get_ticker_master()
 
+# --- サイドバー：自動巡回スキャン機能 ---
 with st.sidebar:
-    st.header("⚙️ システム管理")
-    if st.button("未取得銘柄スキャン (10件ずつ)"):
+    st.header("⚙️ データ収集エンジン")
+    
+    # 1. DBから現在の収集状況を確認
+    try:
         with sqlite3.connect(DB_PATH) as conn:
-            exist = pd.read_sql("SELECT ticker FROM stocks", conn)['ticker'].tolist()
-        targets = [t for t in master.keys() if t not in exist][:10]
-        if targets:
+            exist_df = pd.read_sql("SELECT ticker FROM stocks", conn)
+            exist_tickers = exist_df['ticker'].tolist()
+    except:
+        exist_tickers = []
+    
+    total_count = len(master)
+    collected_count = len(exist_tickers)
+    progress_percent = collected_count / total_count if total_count > 0 else 0
+    
+    st.write(f"📊 収集済み: {collected_count} / {total_count} 銘柄")
+    st.progress(progress_percent)
+
+    st.divider()
+
+    # 2. 自動巡回モードのスイッチ
+    st.subheader("🚀 オートパイロット")
+    auto_mode = st.toggle("自動巡回スキャンを開始", help="ONにすると10秒おきに3銘柄ずつ解析し、自動で画面を更新して次の銘柄へ進みます。")
+
+    if auto_mode:
+        # まだ取得していない銘柄をリストアップ
+        remaining_tickers = [t for t in master.keys() if t not in exist_tickers]
+        
+        if remaining_tickers:
+            targets = remaining_tickers[:3] # 負荷を抑えるため1回3銘柄
+            st.info(f"解析中...残り {len(remaining_tickers)} 銘柄")
+            st.code(", ".join(targets))
+            
+            # 1銘柄ずつ処理
             for t in targets:
-                with st.spinner(f"{t} を解析中..."):
-                    total, scores = calculate_full_score_safe(t)
+                with st.status(f"解析中: {t}", expanded=False) as status:
+                    total, sc = calculate_full_score_safe(t)
                     if total:
                         with sqlite3.connect(DB_PATH) as conn:
-                            conn.execute("INSERT OR REPLACE INTO stocks VALUES (?,?,?,?)", (t, total, json.dumps(scores), datetime.now()))
-                time.sleep(3) # BAN回避のために3秒待機
+                            conn.execute("INSERT OR REPLACE INTO stocks VALUES (?,?,?,?)", 
+                                         (t, total, json.dumps(sc), datetime.now()))
+                        status.update(label=f"✅ {t} 完了 (Score: {total})", state="complete")
+                    else:
+                        status.update(label=f"⚠️ {t} スキップ (データ不足)", state="error")
+                
+                # API制限回避のための「溜め」
+                time.sleep(10) 
+            
+            # 全3銘柄終わったら自動でリロードして次の3銘柄へ
             st.rerun()
+        else:
+            st.success("🎉 全銘柄の解析が完了しました！")
+            st.balloons()
+    else:
+        st.write("😴 スキャン停止中。")
+        st.caption("スイッチをONにすると解析を開始します。ブラウザを閉じずに放置してください。")
 
 @st.fragment(run_every=300)
 def ranking_board():
