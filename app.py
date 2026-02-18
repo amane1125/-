@@ -36,15 +36,17 @@ def get_verified_session():
 
 # --- 2. 共通関数（CAGR・スコアリング） ---
 def cagr(series):
-    try:
-        if len(series) < 5: return 0
-        # 警告回避：ilocを使用
-        start = series.iloc[-5] if len(series) >= 5 else series.iloc[0]
-        end = series.iloc[-1]
-        if start <= 0 or len(series) < 2: return 0
-        years = min(len(series), 5)
-        return ((end/start)**(1/years)-1)*100
-    except: return 0
+    # データが2点以上、かつ最初の値が0や負でないことを確認
+    if series is None or len(series) < 2: return 0
+    start_val = series.iloc[0]
+    end_val = series.iloc[-1]
+    
+    if start_val <= 0 or end_val <= 0: return 0
+    
+    years = len(series) - 1
+    if years < 1: return 0
+    
+    return ((end_val / start_val) ** (1 / years) - 1) * 100
 
 def get_score(value, thresholds):
     for s, t in thresholds:
