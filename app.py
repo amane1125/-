@@ -78,7 +78,7 @@ def get_ticker_master():
 # --- 5. 10項目評価ロジック（401/429対策 & 2026年仕様） ---
 def calculate_full_score_safe(ticker):
     stock = yf.Ticker(ticker)
-    # 評価項目の順番を完全に固定
+    # 円グラフの軸を固定するための定義
     fixed_keys = [
         "連続増配年数", "5年配当CAGR", "純利益5年CAGR", "売上5年CAGR",
         "ROE", "営業利益率", "配当利回り", "予想配当性向"
@@ -90,10 +90,12 @@ def calculate_full_score_safe(ticker):
         time.sleep(1.2)
         inc = stock.income_stmt
         if inc is None or inc.empty: inc = stock.quarterly_income_stmt
+        
         divs = stock.dividends
+        splits = stock.splits  # 株式分割履歴
         time.sleep(1.0)
 
-        # 補助関数：時系列データを必ず「古い順」に整列
+        # 補助関数：時系列データを「古い順」に整列して取得
         def get_clean_ts(df, keywords):
             if df is None or df.empty: return pd.Series()
             for kw in keywords:
@@ -101,42 +103,66 @@ def calculate_full_score_safe(ticker):
                 if matches:
                     series = df.loc[matches[0]]
                     if isinstance(series, pd.DataFrame): series = series.iloc[0]
-                    # インデックス（日付）を古い順にソート
+                    # ★重要：インデックスを昇順（古い順）にソート
                     return series.sort_index(ascending=True).dropna()
             return pd.Series()
 
-        # --- A. 時系列指標 (CAGR・増配) ---
-        net_inc_ts = get_clean_ts(inc, ["Net Income", "Controlling Interests"])
-        rev_ts = get_clean_ts(inc, ["Total Revenue", "Net Sales"])
+        # --- A. 時系列データの抽出 (CAGR用) ---
+        net_inc_ts = get_clean_ts(inc, ["Net Income", "Controlling Interests", "NetIncome"])
+        rev_ts = get_clean_ts(inc, ["Total Revenue", "Net Sales", "Operating Revenue"])
         
-        # 配当データの処理
+        # 配当データの処理（分割補正付き）
         growth_years = 0
         d_cagr_val = 0
         latest_div_sum = 0
+        
         if not divs.empty:
+            # 配当を年単位・昇順で整理
             yearly_div = divs.sort_index(ascending=True).resample("YE").sum()
-            confirmed_div = yearly_div[yearly_div.index.year < 2026] # 2026年問題回避
+            # ★重要：2026年以降の未確定データを除外
+            confirmed_div = yearly_div[yearly_div.index.year < 2026]
+            
             if not confirmed_div.empty:
                 latest_div_sum = confirmed_div.iloc[-1]
+                
+                # ★重要：株式分割による配当額の補正（日本アクア対策）
+                if not splits.empty:
+                    last_split_date = splits.index[-1]
+                    if confirmed_div.index[-1] < last_split_date:
+                        # 最後の配当が分割前なら、分割比率で割って現在の株価に合わせる
+                        latest_div_sum = latest_div_sum / splits.iloc[-1]
+
+                # 連続増配判定
                 if len(confirmed_div) > 1:
-                    # 連続増配カウント（最新から遡る）
                     for i in range(1, len(confirmed_div)):
-                        if confirmed_div.iloc[-i] >= confirmed_div.iloc[-(i+1)]: growth_years += 1
+                        if confirmed_div.iloc[-i] >= confirmed_div.iloc[-(i+1)]:
+                            growth_years += 1
                         else: break
                     d_cagr_val = cagr(confirmed_div)
 
-        # --- B. 単一指標 (ROE・利回り等) ---
+        # --- B. 単一指標の算出 ---
         hist = stock.history(period="1d")
         current_price = hist['Close'].iloc[-1] if not hist.empty else 1
         
-        roe = (info.get("returnOnEquity") or 0) * 100
+        # 営業利益率 (info優先、なければ算出)
         op_margin = (info.get("operatingMargins") or 0) * 100
-        y_val = (latest_div_sum / current_price * 100) if latest_div_sum > 0 else (info.get("dividendYield", 0) * 100)
-        payout = (info.get("payoutRatio") or 0) * 100
+        if op_margin == 0 and not inc.empty:
+            op_inc = get_clean_ts(inc, ["Operating Income", "Operating Profit", "OperatingProfit"]).iloc[-1]
+            rev_val = rev_ts.iloc[-1] if not rev_ts.empty else 0
+            op_margin = (op_inc / rev_val * 100) if rev_val != 0 else 0
 
-        # --- C. スコア計算 (順番を固定した辞書を作成) ---
+        # 利回り (実績ベースを再計算)
+        y_val = (latest_div_sum / current_price * 100) if (latest_div_sum > 0 and current_price > 0) else (info.get("dividendYield", 0) * 100)
+        
+        # ROE (info優先、なければ自前計算)
+        roe = (info.get("returnOnEquity") or 0) * 100
+        if roe == 0 and not net_inc_ts.empty:
+            bal = stock.balance_sheet
+            equity = get_clean_ts(bal, ["Stockholders Equity", "Total Equity"]).iloc[-1]
+            roe = (net_inc_ts.iloc[-1] / equity * 100) if equity != 0 else 0
+
+        # --- C. スコアリング (OrderedDictで順番を固定) ---
         scores = OrderedDict()
-        # 順番を fixed_keys と完全に一致させる
         scores["連続増配年数"] = get_score(growth_years, [(10, 10), (8, 5), (6, 3)])
         scores["5年配当CAGR"] = get_score(d_cagr_val, [(10, 15), (8, 10), (6, 5)])
         scores["純利益5年CAGR"] = get_score(cagr(net_inc_ts), [(10, 15), (8, 10), (6, 5)])
@@ -144,14 +170,12 @@ def calculate_full_score_safe(ticker):
         scores["ROE"] = get_score(roe, [(10, 20), (8, 15), (6, 10)])
         scores["営業利益率"] = get_score(op_margin, [(10, 20), (8, 15), (6, 10)])
         scores["配当利回り"] = get_score(y_val, [(10, 5), (8, 4), (6, 3)])
-        scores["予想配当性向"] = get_score(60 - payout, [(10, 20), (8, 10), (6, 0)])
+        scores["予想配当性向"] = get_score(60 - (info.get("payoutRatio", 0) * 100), [(10, 20), (8, 10), (6, 0)])
 
         return sum(scores.values()), scores
 
     except Exception as e:
-        # エラー時は項目名だけ持った0点辞書を返す（グラフ崩れ防止）
-        empty_scores = OrderedDict({k: 0 for k in fixed_keys})
-        return 0, empty_scores
+        return 0, OrderedDict({k: 0 for k in fixed_keys})
         
 # --- 6. UIメイン ---
 init_db()
