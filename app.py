@@ -149,10 +149,10 @@ master = get_ticker_master()
 
 with st.sidebar:
     st.header("⚙️ システム管理")
-    if st.button("未取得銘柄スキャン (2件ずつ)"):
+    if st.button("未取得銘柄スキャン (10件ずつ)"):
         with sqlite3.connect(DB_PATH) as conn:
             exist = pd.read_sql("SELECT ticker FROM stocks", conn)['ticker'].tolist()
-        targets = [t for t in master.keys() if t not in exist][:2]
+        targets = [t for t in master.keys() if t not in exist][:10]
         if targets:
             for t in targets:
                 with st.spinner(f"{t} を解析中..."):
