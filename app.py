@@ -76,88 +76,91 @@ def get_ticker_master():
 def calculate_full_score_safe(ticker):
     stock = yf.Ticker(ticker)
     try:
-        # 1. 基礎データの取得（まずは info から一括で取るのが今の yfinance では安定します）
+        # 1. データの取得（リトライ付き）
         info = stock.info
-        time.sleep(1.0)
+        time.sleep(1.2)
         
-        # 2. 財務諸表・配当の取得
         inc = stock.income_stmt
+        if inc is None or inc.empty:
+            inc = stock.quarterly_income_stmt
+        
         divs = stock.dividends
         time.sleep(1.0)
-        
-        # 補助関数：データ取得のガード
-        def get_val(df, keywords):
-            if df is None or df.empty: return pd.Series([0])
+
+        # 補助関数：時系列データを正しく「古い順」に整列させて取得
+        def get_time_series(df, keywords):
+            if df is None or df.empty: return pd.Series()
             for kw in keywords:
                 matches = [i for i in df.index if kw.lower().replace(" ", "") in i.lower().replace(" ", "")]
                 if matches:
-                    val = df.loc[matches[0]]
-                    return val if isinstance(val, pd.Series) else pd.Series([val])
-            return pd.Series([0])
+                    series = df.loc[matches[0]]
+                    if isinstance(series, pd.DataFrame): series = series.iloc[0]
+                    # 日付インデックスを昇順（古い順）に並び替え
+                    return series.sort_index(ascending=True)
+            return pd.Series()
 
-        # --- A. 配当利回り & 連続増配 (info + 実績のハイブリッド) ---
-        # 予想利回りがあれば採用、なければ実績から計算
-        raw_yield = info.get('dividendYield')
-        y_val = (raw_yield * 100 if raw_yield and raw_yield < 1.0 else raw_yield) or 0
+        # --- A. 時系列指標の抽出 (円グラフ左側) ---
+        net_inc_ts = get_time_series(inc, ["Net Income", "Controlling Interests"])
+        rev_ts = get_time_series(inc, ["Total Revenue", "Net Sales", "Operating Revenue"])
         
+        # 成長率の計算 (cagr関数に渡す前にNoneチェック)
+        eps_cagr_val = cagr(net_inc_ts) if not net_inc_ts.empty else 0
+        rev_cagr_val = cagr(rev_ts) if not rev_ts.empty else 0
+
+        # --- B. 配当関連 (円グラフ左上) ---
         growth_years = 0
-        d_cagr = 0
+        d_cagr_val = 0
+        latest_div_sum = 0
+        
         if not divs.empty:
+            # 配当も古い順に並び替え
+            divs = divs.sort_index(ascending=True)
             yearly_div = divs.resample("YE").sum()
             confirmed_div = yearly_div[yearly_div.index.year < 2026]
-            if len(confirmed_div) > 1:
-                for i in range(1, len(confirmed_div)):
-                    if confirmed_div.iloc[-i] >= confirmed_div.iloc[-(i+1)]: growth_years += 1
-                    else: break
-                d_cagr = cagr(confirmed_div)
-            # infoの利回りが0なら実績から算出
-            if y_val == 0 and not confirmed_div.empty:
-                hist = stock.history(period="1d")
-                curr_p = hist['Close'].iloc[-1] if not hist.empty else 1
-                y_val = (confirmed_div.iloc[-1] / curr_p) * 100
+            
+            if not confirmed_div.empty:
+                latest_div_sum = confirmed_div.iloc[-1]
+                if len(confirmed_div) > 1:
+                    # 連続増配カウント
+                    for i in range(1, len(confirmed_div)):
+                        if confirmed_div.iloc[-i] >= confirmed_div.iloc[-(i+1)]:
+                            growth_years += 1
+                        else: break
+                    d_cagr_val = cagr(confirmed_div)
 
-        # --- B. 収益性指標 (ROE & 営業利益率) ---
-        roe = (info.get("returnOnEquity") or 0) * 100
+        # --- C. 収益性・利回り (円グラフ右側) ---
+        hist = stock.history(period="1d")
+        current_price = hist['Close'].iloc[-1] if not hist.empty else 1
+        
+        # 営業利益率
         op_margin = (info.get("operatingMargins") or 0) * 100
-        
-        # info が空の場合のバックアップ（財務諸表から）
         if op_margin == 0:
-            op_inc = get_val(inc, ["Operating Income", "Operating Profit"]).iloc[0]
-            rev = get_val(inc, ["Total Revenue", "Net Sales"]).iloc[0]
-            op_margin = (op_inc / rev * 100) if rev != 0 else 0
+            op_inc = get_time_series(inc, ["Operating Income", "Operating Profit"]).iloc[-1] if not inc.empty else 0
+            rev_val = rev_ts.iloc[-1] if not rev_ts.empty else 0
+            op_margin = (op_inc / rev_val * 100) if rev_val != 0 else 0
 
-        # --- C. 成長性 & 割安性 ---
-        net_inc_series = get_val(inc, ["Net Income", "Controlling Interests"])
-        rev_series = get_val(inc, ["Total Revenue", "Net Sales"])
+        # 利回り
+        y_val = (latest_div_sum / current_price * 100) if latest_div_sum > 0 else (info.get("dividendYield", 0) * 100)
         
-        eps_cagr = cagr(net_inc_series[::-1])
-        rev_cagr = cagr(rev_series[::-1])
-        
-        payout = (info.get("payoutRatio") or 0) * 100
-        mkt_cap = info.get("marketCap", 0)
-        net_inc_val = net_inc_series.iloc[0] if not net_inc_series.empty else 1
-        # 簡易PER
-        pe_val = mkt_cap / net_inc_val if net_inc_val > 0 else 999
+        # ROE
+        roe = (info.get("returnOnEquity") or 0) * 100
 
         # --- D. スコアリング ---
         scores = {
             "連続増配年数": get_score(growth_years, [(10, 10), (8, 5), (6, 3)]),
-            "5年配当CAGR": get_score(d_cagr, [(10, 15), (8, 10), (6, 5)]),
-            "予想配当性向": get_score(60 - payout, [(10, 20), (8, 10), (6, 0)]),
-            "純利益5年CAGR": get_score(eps_cagr, [(10, 15), (8, 10), (6, 5)]),
+            "5年配当CAGR": get_score(d_cagr_val, [(10, 15), (8, 10), (6, 5)]),
+            "純利益5年CAGR": get_score(eps_cagr_val, [(10, 15), (8, 10), (6, 5)]),
+            "売上5年CAGR": get_score(rev_cagr_val, [(10, 10), (8, 5), (6, 3)]),
             "ROE": get_score(roe, [(10, 20), (8, 15), (6, 10)]),
-            "売上5年CAGR": get_score(rev_cagr, [(10, 10), (8, 5), (6, 3)]),
             "営業利益率": get_score(op_margin, [(10, 20), (8, 15), (6, 10)]),
-            "PER/割安性": get_score(25 - pe_val, [(10, 15), (8, 5), (6, 0)]),
-            "配当利回り": get_score(y_val, [(10, 5), (8, 4), (6, 3)])
+            "配当利回り": get_score(y_val, [(10, 5), (8, 4), (6, 3)]),
+            "予想配当性向": get_score(60 - (info.get("payoutRatio", 0)*100), [(10, 20), (8, 10), (6, 0)])
         }
 
-        # スコア合計が0（全失敗）ならNoneを返してスキップ
-        if sum(scores.values()) == 0: return None, None
         return sum(scores.values()), scores
 
     except Exception as e:
-        print(f"Fetch Error: {ticker} - {e}")
+        print(f"Error logic: {e}")
         return None, None
         
 # --- 6. UIメイン ---
