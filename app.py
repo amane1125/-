@@ -76,7 +76,7 @@ def get_ticker_master():
 def calculate_full_score_safe(ticker):
     session = get_verified_session()
     # 修正：セッションをTickerに渡す
-    stock = yf.Ticker(ticker, session=session)
+    stock = yf.Ticker(ticker)
     
     try:
         info = stock.info
