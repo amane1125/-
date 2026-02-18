@@ -76,87 +76,127 @@ def get_ticker_master():
 def calculate_full_score_safe(ticker):
     stock = yf.Ticker(ticker)
     try:
-        # 1. 財務諸表の取得（通年+四半期をマージして補完）
+        # 1. データの取得 (通年優先、なければ四半期で補完)
         inc = stock.income_stmt
         if inc is None or inc.empty: inc = stock.quarterly_income_stmt
+        time.sleep(1.0)
+        
         bal = stock.balance_sheet
         if bal is None or bal.empty: bal = stock.quarterly_balance_sheet
+        time.sleep(1.0)
         
-        # 2. 株式分割履歴の取得（利回り補正用）
-        splits = stock.splits
-        
-        # 補助関数：超広範囲キーワード検索
+        divs = stock.dividends
+        splits = stock.splits # 日本アクア等の分割対策用
+
+        # 補助関数：超柔軟キーワード検索
         def find_row(df, keywords):
             if df is None or df.empty: return pd.Series()
             for kw in keywords:
+                # 文字列を正規化して検索
                 matches = [i for i in df.index if kw.lower().replace(" ", "") in i.lower().replace(" ", "")]
                 if matches:
                     res = df.loc[matches[0]]
+                    # 複数行ある場合は最初の1行、Seriesならそのまま
                     return res if isinstance(res, pd.Series) else res.iloc[0]
             return pd.Series()
 
-        # --- A. 財務データの抽出 (日本株の全ラベル対応) ---
-        # 営業利益：'Operating Income' だけでなく 'Operating Profit'、'EBIT'、'Total Operating Profit'
+        # --- A. 財務データの抽出 (全セクター対応) ---
+        # 営業利益 (日本株の多様なラベルを網羅)
         op_inc_series = find_row(inc, ["Operating Income", "Operating Profit", "OperatingProfit", "EBIT", "Total Operating Income"])
         # 売上高
         rev_series = find_row(inc, ["Total Revenue", "Operating Revenue", "Net Sales", "Revenue"])
         # 純利益
-        net_inc_series = find_row(inc, ["Net Income Common Stockholders", "Net Income", "Controlling Interests"])
-        # 純資産・内部留保
-        equity_series = find_row(bal, ["Stockholders Equity", "Total Equity", "Common Stock Equity"])
+        net_inc_series = find_row(inc, ["Net Income Common Stockholders", "Net Income", "Controlling Interests", "NetIncome"])
+        # 純資産 (ROE計算用)
+        equity_series = find_row(bal, ["Stockholders Equity", "Total Equity", "Common Stock Equity", "TotalAssets" ]) # Assetsは最終手段
+        # 内部留保
         retained_series = find_row(bal, ["Retained Earnings", "RetainedEarnings"])
+        # 現金 (CN-PER用)
+        cash_series = find_row(bal, ["Cash And Cash Equivalents", "CashAndCashEquivalents", "Cash"])
 
-        # --- B. 配当計算（分割補正ロジック） ---
-        divs = stock.dividends
+        # --- B. 配当計算 (2026年問題 & 分割補正) ---
         latest_div_sum = 0
+        growth_years = 0
+        d_cagr = 0
+        
         if not divs.empty:
-            # 2026年問題回避
             yearly_div = divs.resample("YE").sum()
-            c_year = datetime.now().year
-            # 最新の配当実績を取得
-            recent_divs = yearly_div[yearly_div.index.year < c_year]
-            if not recent_divs.empty:
-                latest_div_sum = recent_divs.iloc[-1]
+            if hasattr(yearly_div.index, 'year'):
+                c_year = datetime.now().year
+                # 2025年以前の確定データ
+                confirmed_div = yearly_div[yearly_div.index.year < c_year]
                 
-                # 【重要】分割補正：最後に分割があった日以降の配当かチェック
-                if not splits.empty:
-                    last_split_date = splits.index[-1]
-                    last_div_date = recent_divs.index[-1]
-                    # もし配当実績が分割「前」のものなら、分割比率で割る
-                    if last_div_date < last_split_date:
-                        split_ratio = splits.iloc[-1]
-                        latest_div_sum = latest_div_sum / split_ratio
+                if not confirmed_div.empty:
+                    latest_div_sum = confirmed_div.iloc[-1]
+                    
+                    # 【重要】株式分割による配当利回りの異常（2倍等）を補正
+                    if not splits.empty:
+                        last_split_date = splits.index[-1]
+                        last_div_date = confirmed_div.index[-1]
+                        # 最後の配当が「分割前」なら、現在の株価に合わせて配当額を調整
+                        if last_div_date < last_split_date:
+                            latest_div_sum = latest_div_sum / splits.iloc[-1]
 
-        # --- C. 数値の計算 ---
+                    # 連続増配判定
+                    if len(confirmed_div) > 1:
+                        for i in range(1, len(confirmed_div)):
+                            if confirmed_div.iloc[-i] >= confirmed_div.iloc[-(i+1)]:
+                                growth_years += 1
+                            else: break
+                        d_cagr = cagr(confirmed_div)
+
+        # --- C. 数値の計算 (自前算出 + infoフォールバック) ---
+        # 1. 株価取得
         hist = stock.history(period="1d")
         current_price = hist['Close'].iloc[-1] if not hist.empty else 0
         
-        # 1. 営業利益率（op_inc_series が取れない場合の最終手段として info も参照）
+        # 2. 営業利益率
         op_val = op_inc_series.iloc[0] if not op_inc_series.empty else 0
         rev_val = rev_series.iloc[0] if not rev_series.empty else 0
         if op_val != 0 and rev_val != 0:
             op_margin = (op_val / rev_val * 100)
         else:
+            # 財務諸表から取れなければ info から
             op_margin = (stock.info.get("operatingMargins") or 0) * 100
 
-        # 2. 配当利回り（計算値）
+        # 3. 配当利回り
         y_val = (latest_div_sum / current_price * 100) if (current_price > 0 and latest_div_sum > 0) else 0
 
-        # 3. ROE
-        info = stock.info
-        roe = (info.get("returnOnEquity") or 0) * 100
+        # 4. ROE
+        roe = (stock.info.get("returnOnEquity") or 0) * 100
         if roe == 0 and not net_inc_series.empty and not equity_series.empty:
+            # 財務諸表から自前計算
             roe = (net_inc_series.iloc[0] / equity_series.iloc[0] * 100)
+            
+        # 5. 配当性向
+        payout = (stock.info.get("payoutRatio") or 0) * 100
+
+        # 6. 配当維持可能年数
+        retained = retained_series.iloc[0] if not retained_series.empty else 0
+        shares = stock.info.get("sharesOutstanding", 1)
+        sustain = retained / (latest_div_sum * shares) if (latest_div_sum > 0 and shares > 0) else 0
+
+        # 7. CN-PER (割安性)
+        mkt_cap = stock.info.get("marketCap", 0)
+        cash_val = cash_series.iloc[0] if not cash_series.empty else 0
+        net_inc_val = net_inc_series.iloc[0] if not net_inc_series.empty else 1
+        cn_per = (mkt_cap - cash_val) / net_inc_val if net_inc_val > 0 else 999
 
         # --- D. スコアリング ---
-        # (以前の get_score ロジックをそのまま使用)
         scores = {
-            "営業利益率": get_score(op_margin, [(10, 20), (8, 15), (6, 10)]),
-            "配当利回り": get_score(y_val, [(10, 5), (8, 4), (6, 3)]),
+            "連続増配年数": get_score(growth_years, [(10, 10), (8, 5), (6, 3)]),
+            "5年配当CAGR": get_score(d_cagr, [(10, 15), (8, 10), (6, 5)]),
+            "予想配当性向": get_score(60 - payout, [(10, 20), (8, 10), (6, 0)]),
+            "純利益5年CAGR": get_score(cagr(net_inc_series[::-1]), [(10, 15), (8, 10), (6, 5)]),
             "ROE": get_score(roe, [(10, 20), (8, 15), (6, 10)]),
-            # ... 他の項目も同様 ...
+            "配当維持可能年数": get_score(sustain, [(10, 10), (8, 5), (6, 3)]),
+            "売上5年CAGR": get_score(cagr(rev_series[::-1]), [(10, 10), (8, 5), (6, 3)]),
+            "営業利益率": get_score(op_margin, [(10, 20), (8, 15), (6, 10)]),
+            "CN-PER": get_score(30 - cn_per, [(10, 15), (8, 5), (6, 0)]),
+            "配当利回り": get_score(y_val, [(10, 5), (8, 4), (6, 3)])
         }
-        
+
+        if sum(scores.values()) == 0: return None, None
         return sum(scores.values()), scores
 
     except Exception as e:
