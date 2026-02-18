@@ -7,15 +7,14 @@ import os
 # ① JPXから全銘柄取得
 # =========================
 def get_all_tickers():
-    url = "https://www.jpx.co.jp/markets/statistics-equities/misc/tvdivq0000001vg2-att/data_j.xls"
-    df = pd.read_excel(url)
-
-    # 内国株式のみ
+    url = "https://www.jpx.co.jp/markets/statistics-equities/misc/tvdivq0000001vg2-att/data_j.csv"
+    
+    df = pd.read_csv(url, encoding="shift_jis")
     df = df[df["市場・商品区分"].str.contains("内国株式", na=False)]
-
-    # ".T" を付与
+    
     tickers = df["コード"].astype(str) + ".T"
     return set(tickers)
+
 
 
 # =========================
