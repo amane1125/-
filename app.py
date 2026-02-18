@@ -1,395 +1,294 @@
 import streamlit as st
 import pandas as pd
 import yfinance as yf
+from io import BytesIO
 import requests
+from concurrent.futures import ThreadPoolExecutor
 import sqlite3
-import json
-import os
 import time
-import urllib.request
 import plotly.graph_objects as go
-from datetime import datetime
-from collections import OrderedDict
+import os
 
-# --- 基本設定 ---
-st.set_page_config(page_title="Dividend Growth 100 RT", layout="wide")
+st.set_page_config(page_title="Dividend Growth 100", layout="wide")
 st.title("🇯🇵 Dividend Growth 100")
-st.write("2026年 認証エラー(401)・API制限(429) 対策済みモデル")
+st.write("増配企業を100点満点で評価します")
 
 DB_PATH = "stock_data.db"
-JPX_FILE = "jpx_list.xls"
 
-# --- 1. 【最重要】401エラーを回避するための認証セッション生成 ---
-def get_verified_session():
-    session = requests.Session()
-    session.headers.update({
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
-        'Accept-Language': 'ja,en-US;q=0.9,en;q=0.8',
-    })
-    try:
-        # まずFinanceトップを叩いて認証用Cookieをサーバーから受け取る
-        session.get('https://finance.yahoo.com', timeout=10)
-    except:
-        pass
-    return session
-
-# --- 2. 共通関数（CAGR・スコアリング） ---
+# ------------------------
+# 共通関数
+# ------------------------
 def cagr(series):
-    # データが2点以上、かつ最初の値が0や負でないことを確認
-    if series is None or len(series) < 2: return 0
-    start_val = series.iloc[0]
-    end_val = series.iloc[-1]
-    
-    if start_val <= 0 or end_val <= 0: return 0
-    
-    years = len(series) - 1
-    if years < 1: return 0
-    
-    return ((end_val / start_val) ** (1 / years) - 1) * 100
-
-def get_score(value, thresholds):
-    for s, t in thresholds:
-        if value >= t: return s
-    return 0
-
-# --- 3. データベース初期化 ---
-def init_db():
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute('''CREATE TABLE IF NOT EXISTS stocks (
-            ticker TEXT PRIMARY KEY,
-            total_score INTEGER,
-            score_json TEXT,
-            last_update TIMESTAMP
-        )''')
-
-# --- 4. JPXマスターデータ取得 ---
-@st.cache_data
-def get_ticker_master():
-    if not os.path.exists(JPX_FILE):
-        url = "https://www.jpx.co.jp/markets/statistics-equities/misc/tvdivq0000001vg2-att/data_j.xls"
-        urllib.request.urlretrieve(url, JPX_FILE)
     try:
-        df = pd.read_excel(JPX_FILE)
-    except: return {}
-    df = df[df["市場・商品区分"].str.contains("内国株式", na=False)]
-    return {str(row["コード"]) + ".T": {"name": row["銘柄名"], "sector": row["33業種区分"]} for _, row in df.iterrows()}
-
-# --- 5. 10項目評価ロジック（401/429対策 & 2026年仕様） ---
-def calculate_full_score_safe(ticker):
-    stock = yf.Ticker(ticker)
-    # 円グラフの軸と表示順を完全に固定（12時から時計回り）
-    fixed_keys = [
-        "連続増配年数", "5年配当CAGR", "純利益5年CAGR", "売上5年CAGR",
-        "ROE", "営業利益率", "配当利回り", "予想配当性向"
-    ]
-    
-    try:
-        # 1. データの取得（リトライを考慮した待機時間）
-        info = stock.info
-        time.sleep(1.2)
-        inc = stock.income_stmt
-        if inc is None or inc.empty: 
-            inc = stock.quarterly_income_stmt
-        
-        divs = stock.dividends
-        splits = stock.splits
-        time.sleep(1.0)
-
-        # 補助関数：日本株特有の項目名揺れに対応し、古い順にソートして取得
-        def get_clean_ts(df, keywords):
-            if df is None or df.empty: return pd.Series()
-            for kw in keywords:
-                matches = [i for i in df.index if kw.lower().replace(" ", "") in i.lower().replace(" ", "")]
-                if matches:
-                    series = df.loc[matches[0]]
-                    if isinstance(series, pd.DataFrame): series = series.iloc[0]
-                    return series.sort_index(ascending=True).dropna()
-            return pd.Series()
-
-        # --- A. 時系列指標 (CAGR・増配判定用) ---
-        net_inc_ts = get_clean_ts(inc, ["Net Income", "Controlling Interests", "NetIncome"])
-        rev_ts = get_clean_ts(inc, ["Total Revenue", "Net Sales", "Operating Revenue"])
-        
-        # 配当データの処理（分割補正付き）
-        growth_years = 0
-        d_cagr_val = 0
-        latest_div_sum = 0
-        if not divs.empty:
-            yearly_div = divs.sort_index(ascending=True).resample("YE").sum()
-            confirmed_div = yearly_div[yearly_div.index.year < 2026] # 今年の端数を除外
-            
-            if not confirmed_div.empty:
-                latest_div_sum = confirmed_div.iloc[-1]
-                # 株式分割の補正（日本アクア等）
-                if not splits.empty:
-                    last_split_date = splits.index[-1]
-                    if confirmed_div.index[-1] < last_split_date:
-                        latest_div_sum = latest_div_sum / splits.iloc[-1]
-
-                if len(confirmed_div) > 1:
-                    for i in range(1, len(confirmed_div)):
-                        if confirmed_div.iloc[-i] >= confirmed_div.iloc[-(i+1)]:
-                            growth_years += 1
-                        else: break
-                    d_cagr_val = cagr(confirmed_div)
-
-        # --- B. 営業利益率と配当利回りの復活ロジック ---
-        hist = stock.history(period="1d")
-        current_price = hist['Close'].iloc[-1] if not hist.empty else 1
-        
-        # 1. 営業利益率（バックアップ算出）
-        op_margin = (info.get("operatingMargins") or 0) * 100
-        if op_margin == 0 and not inc.empty:
-            op_inc_ts = get_clean_ts(inc, ["Operating Income", "Operating Profit", "OperatingProfit"])
-            if not op_inc_ts.empty and not rev_ts.empty:
-                op_margin = (op_inc_ts.iloc[-1] / rev_ts.iloc[-1] * 100) if rev_ts.iloc[-1] != 0 else 0
-
-        # 2. 配当利回り（実績ベース算出）
-        # infoが空または異常な場合、(実績配当 / 現在株価) で自前計算
-        y_val = (latest_div_sum / current_price * 100) if (latest_div_sum > 0 and current_price > 0) else (info.get("dividendYield", 0) * 100)
-        
-        # 3. ROE
-        roe = (info.get("returnOnEquity") or 0) * 100
-        
-        # 4. 配当性向
-        payout = (info.get("payoutRatio") or 0) * 100
-
-        # --- C. スコアリング (OrderedDictで順番を固定) ---
-        scores = OrderedDict()
-        scores["連続増配年数"] = get_score(growth_years, [(10, 10), (8, 5), (6, 3)])
-        scores["5年配当CAGR"] = get_score(d_cagr_val, [(10, 15), (8, 10), (6, 5)])
-        scores["純利益5年CAGR"] = get_score(cagr(net_inc_ts), [(10, 15), (8, 10), (6, 5)])
-        scores["売上5年CAGR"] = get_score(cagr(rev_ts), [(10, 10), (8, 5), (6, 3)])
-        scores["ROE"] = get_score(roe, [(10, 20), (8, 15), (6, 10)])
-        scores["営業利益率"] = get_score(op_margin, [(10, 20), (8, 15), (6, 10)])
-        scores["配当利回り"] = get_score(y_val, [(10, 5), (8, 4), (6, 3)])
-        scores["予想配当性向"] = get_score(60 - payout, [(10, 20), (8, 10), (6, 0)])
-
-        return sum(scores.values()), scores
-
-    except Exception as e:
-        return 0, OrderedDict({k: 0 for k in fixed_keys})
-        
-# --- 6. UIメイン ---
-init_db()
-master = get_ticker_master()
-
-# --- サイドバー：自動巡回スキャン機能 ---
-with st.sidebar:
-    st.header("⚙️ データ収集エンジン")
-    
-    # 1. DBから現在の収集状況を確認
-    try:
-        with sqlite3.connect(DB_PATH) as conn:
-            exist_df = pd.read_sql("SELECT ticker FROM stocks", conn)
-            exist_tickers = exist_df['ticker'].tolist()
+        if len(series) < 5:
+            return 0
+        start = series.iloc[-5]
+        end = series.iloc[0]
+        if start <= 0:
+            return 0
+        return ((end/start)**(1/5)-1)*100
     except:
-        exist_tickers = []
-    
-    total_count = len(master)
-    collected_count = len(exist_tickers)
-    progress_percent = collected_count / total_count if total_count > 0 else 0
-    
-    st.write(f"📊 収集済み: {collected_count} / {total_count} 銘柄")
-    st.progress(progress_percent)
+        return 0
 
-    st.divider()
+def score(value, thresholds):
+    for s, t in thresholds:
+        if value >= t:
+            return s
+    return 2
 
-    # 2. 自動巡回モードのスイッチ
-    st.subheader("🚀 オートパイロット")
-    auto_mode = st.toggle("自動巡回スキャンを開始", help="ONにすると10秒おきに3銘柄ずつ解析し、自動で画面を更新して次の銘柄へ進みます。")
+# ------------------------
+# JPX Excelから全銘柄取得
+# ------------------------
+def get_all_tickers():
+    url = "https://www.jpx.co.jp/markets/statistics-equities/misc/tvdivq0000001vg2-att/data_j.xls"
+    headers = {"User-Agent": "Mozilla/5.0"}
+    response = requests.get(url, headers=headers)
+    response.raise_for_status()
+    df = pd.read_excel(BytesIO(response.content))
+    df = df[df["市場・商品区分"].str.contains("内国株式", na=False)]
+    tickers = df["コード"].astype(str) + ".T"
+    return set(tickers)
 
-    if auto_mode:
-        # まだ取得していない銘柄をリストアップ
-        remaining_tickers = [t for t in master.keys() if t not in exist_tickers]
-        
-        if remaining_tickers:
-            targets = remaining_tickers[:3] # 負荷を抑えるため1回3銘柄
-            st.info(f"解析中...残り {len(remaining_tickers)} 銘柄")
-            st.code(", ".join(targets))
-            
-            # 1銘柄ずつ処理
-            for t in targets:
-                with st.status(f"解析中: {t}", expanded=False) as status:
-                    total, sc = calculate_full_score_safe(t)
-                    if total:
-                        with sqlite3.connect(DB_PATH) as conn:
-                            conn.execute("INSERT OR REPLACE INTO stocks VALUES (?,?,?,?)", 
-                                         (t, total, json.dumps(sc), datetime.now()))
-                        status.update(label=f"✅ {t} 完了 (Score: {total})", state="complete")
-                    else:
-                        status.update(label=f"⚠️ {t} スキップ (データ不足)", state="error")
-                
-                # API制限回避のための「溜め」
-                time.sleep(10) 
-            
-            # 全3銘柄終わったら自動でリロードして次の3銘柄へ
-            st.rerun()
+# ------------------------
+# SQLite 初期化
+# ------------------------
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS stocks (
+        ticker TEXT PRIMARY KEY,
+        total_score INTEGER,
+        score_json TEXT,
+        last_update TIMESTAMP
+    )''')
+    conn.commit()
+    return conn
+
+# ------------------------
+# 個別銘柄評価
+# ------------------------
+def calculate_score(code):
+    stock = yf.Ticker(code)
+    info = stock.info
+
+    dividends = stock.dividends
+    income_stmt = stock.income_stmt
+    balance = stock.balance_sheet
+
+    yearly_div = dividends.resample("YE").sum() if not dividends.empty else pd.Series()
+
+    growth_years = 0
+    for i in range(1, len(yearly_div)):
+        if yearly_div.iloc[i] > yearly_div.iloc[i-1]:
+            growth_years += 1
+
+    div_cagr = cagr(yearly_div)
+    payout = (info.get("payoutRatio") or 0) * 100
+
+    net_income_series = income_stmt.loc["Net Income"] if "Net Income" in income_stmt.index else pd.Series()
+    eps_cagr = cagr(net_income_series)
+    roe = (info.get("returnOnEquity") or 0) * 100
+    retained = balance.loc["Retained Earnings"][0] if "Retained Earnings" in balance.index else 0
+    annual_div = yearly_div.iloc[0] if len(yearly_div) > 0 else 1
+    sustain = retained / annual_div if annual_div > 0 else 0
+
+    revenue_series = income_stmt.loc["Total Revenue"] if "Total Revenue" in income_stmt.index else pd.Series()
+    revenue_cagr = cagr(revenue_series)
+        # 営業利益率を自前計算
+        if "Operating Income" in income_stmt.index and "Total Revenue" in income_stmt.index:
+            op_income = income_stmt.loc["Operating Income"]
+            total_revenue = income_stmt.loc["Total Revenue"]
+            # 直近年度の値で計算
+            op_margin = (op_income.iloc[0] / total_revenue.iloc[0]) * 100 if total_revenue.iloc[0] != 0 else None
         else:
-            st.success("🎉 全銘柄の解析が完了しました！")
-            st.balloons()
+            op_margin = None
+    market_cap = info.get("marketCap", 0)
+    cash = balance.loc["Cash And Cash Equivalents"][0] if "Cash And Cash Equivalents" in balance.index else 0
+    net_income = net_income_series.iloc[0] if len(net_income_series) > 0 else 1
+    cn_per = (market_cap - cash) / net_income if net_income != 0 else 999
+    dividend_yield_raw = info.get("dividendYield")
+    if dividend_yield_raw is not None and dividend_yield_raw > 0:
+        if dividend_yield_raw < 1:
+            dividend_yield = dividend_yield_raw * 100
+        else:
+            dividend_yield = dividend_yield_raw
     else:
-        st.write("😴 スキャン停止中。")
-        st.caption("スイッチをONにすると解析を開始します。ブラウザを閉じずに放置してください。")
+        # 直近配当金÷株価×100で自前計算
+        if len(yearly_div) > 0 and "regularMarketPrice" in info and info["regularMarketPrice"]:
+            dividend_yield = (yearly_div.iloc[0] / info["regularMarketPrice"]) * 100
+        else:
+            dividend_yield = 0
 
-@st.fragment(run_every=300)
-def ranking_board():
-    st.header("📊 総合スコアランキング (TOP 50)")
-    with sqlite3.connect(DB_PATH) as conn:
-        df = pd.read_sql("SELECT * FROM stocks", conn)
-    
-    if not df.empty:
-        df = df.sort_values("total_score", ascending=False).head(50).copy()
-        df['銘柄名'] = df['ticker'].apply(lambda x: master.get(x, {}).get('name', '不明'))
-        df['業種'] = df['ticker'].apply(lambda x: master.get(x, {}).get('sector', '不明'))
-        
-        try:
-            # 最新株価をバルク取得
-            prices_data = yf.download(df['ticker'].tolist(), period="1d", progress=False)
-            prices = prices_data['Close'].iloc[-1]
-            df['現在値'] = df['ticker'].map(prices).round(1)
-            
-            # 2026年仕様: 選択機能を有効にしたテーブル
-            display_df = df[['total_score', '銘柄名', '業種', '現在値', 'ticker']].rename(columns={'total_score':'点数'})
-            
-            event = st.dataframe(
-                display_df,
-                width='stretch',
-                hide_index=True,
-                on_select="rerun", # 選択時にリロードして下の詳細を表示
-                selection_mode="single-row" # 1件ずつ選択
-            )
-            
-            # 銘柄が選択された場合の詳細表示
-            if event.selection.rows:
-                selected_idx = event.selection.rows[0]
-                selected_ticker = display_df.iloc[selected_idx]['ticker']
-                show_details(selected_ticker, df[df['ticker'] == selected_ticker].iloc[0])
+    scores = {
+        "連続増配年数": score(growth_years, [(10,10),(8,5),(6,3)]),
+        "5年配当CAGR": score(div_cagr, [(10,15),(8,10),(6,5)]),
+        "予想配当性向": score(60-payout, [(10,20),(8,10),(6,0)]),
+        "純利益5年CAGR": score(eps_cagr, [(10,15),(8,10),(6,5)]),
+        "ROE": score(roe, [(10,20),(8,15),(6,10)]),
+        "配当維持可能年数": score(sustain, [(10,10),(8,5),(6,3)]),
+        "売上5年CAGR": score(revenue_cagr, [(10,10),(8,5),(6,3)]),
+        "営業利益率": score(op_margin, [(6,10),(8,15),(10,20)]) if op_margin is not None else "N/A",
+        "CN-PER": score(30-cn_per, [(10,15),(8,5),(6,0)]),
+        "配当利回り": score(dividend_yield, [
+            (10,4.5),
+            (9,4.25),
+            (8,4.0),
+            (7,3.75),
+            (6,3.5),
+            (5,3.25),
+            (4,3.0),
+            (3,2.75),
+            (2,2.5)
+        ]) if dividend_yield is not None else "N/A"
+    }
 
-        except Exception as e:
-            st.error(f"表示エラー: {e}")
+    total = sum([v for v in scores.values() if isinstance(v, int)])
+    return total, scores
+
+# ------------------------
+# キャッシュ更新
+# ------------------------
+def fetch_and_cache(ticker, conn):
+    try:
+        total, scores = calculate_score(ticker)
+        import json
+        c = conn.cursor()
+        c.execute('''INSERT OR REPLACE INTO stocks (ticker, total_score, score_json, last_update)
+                     VALUES (?, ?, ?, CURRENT_TIMESTAMP)''',
+                  (ticker, total, json.dumps(scores)))
+        conn.commit()
+        return {"ticker": ticker, "total_score": total, **scores}
+    except:
+        return None
+
+# ------------------------
+# 初期化
+# ------------------------
+conn = init_db()
+st.write("取得中です。初回は数分かかる場合があります…")
+
+# JPX取得
+try:
+    all_tickers = get_all_tickers()
+except:
+    st.error("JPXデータ取得に失敗しました")
+    all_tickers = set()
+
+# 既存DBの銘柄取得
+cur = conn.cursor()
+cur.execute("SELECT ticker FROM stocks")
+old_tickers = set([row[0] for row in cur.fetchall()])
+
+add_tickers = all_tickers - old_tickers
+st.write(f"新規銘柄数: {len(add_tickers)}")
+
+# 並列取得
+with ThreadPoolExecutor(max_workers=5) as executor:
+    new_data = list(executor.map(lambda t: fetch_and_cache(t, conn), add_tickers))
+
+# ------------------------
+# ランキング表示
+# ------------------------
+st.header("📊 ランキング分析")
+cur.execute("SELECT * FROM stocks")
+rows = cur.fetchall()
+import json
+columns = ["ticker","総合点","score_json","last_update"]
+df = pd.DataFrame(rows, columns=columns)
+df["score_json"] = df["score_json"].apply(json.loads)
+df["総合点"] = df["総合点"].astype(int)
+sorted_df = df.sort_values("総合点", ascending=False)
+st.dataframe(sorted_df[["ticker","総合点"]], use_container_width=True)
+
+# ------------------------
+# 個別銘柄分析
+# ------------------------
+st.header("🔎 個別銘柄分析")
+ticker_input = st.text_input("銘柄コード（例: 9432）")
+if ticker_input:
+    ticker = ticker_input if ticker_input.endswith(".T") else ticker_input + ".T"
+    cur.execute("SELECT score_json, total_score FROM stocks WHERE ticker=?", (ticker,))
+    row = cur.fetchone()
+    if row:
+        scores = row[0]
+        total = row[1]
     else:
-        st.info("サイドバーのスキャンを実行してデータを蓄積してください。")
+        total, scores = calculate_score(ticker)
 
-# --- 詳細表示用関数 ---
-def show_details(ticker, row_data):
-    st.divider()
-    name = master.get(ticker, {}).get('name', '不明')
-    st.subheader(f"🔍 {name} ({ticker}) の詳細分析")
-    
-    col1, col2 = st.columns([1, 1])
-    
-    # 指標の並び順を定義（12時方向から時計回り）
-    fixed_keys = [
-        "連続増配年数", "5年配当CAGR", "純利益5年CAGR", "売上5年CAGR",
-        "ROE", "営業利益率", "配当利回り", "予想配当性向"
-    ]
-    
-    # JSONからスコアを取得
-    raw_scores = json.loads(row_data['score_json'])
-    
-    # 1. 順序を固定したリストを作成
-    categories = fixed_keys
-    values = [raw_scores.get(k, 0) for k in categories]
-    
-# 1. レーダーチャート
-    with col1:
-        st.write("📈 指標別スコア")
-        
-        fig_radar = go.Figure(data=go.Scatterpolar(
-            r=values + [values[0]],
-            theta=categories + [categories[0]],
-            fill='toself',
-            fillcolor='rgba(31, 119, 180, 0.4)',
-            line_color='#1f77b4'
-        ))
-        
-        fig_radar.update_layout(
-            polar=dict(
-                radialaxis=dict(
-                    visible=True, 
-                    range=[0, 10],
-                    tickfont=dict(size=10),
-                    gridcolor="lightgrey"
-                ),
-                angularaxis=dict(
-                    direction="clockwise", # 時計回りに設定
-                    period=len(categories),
-                    gridcolor="lightgrey"
-                )
-            ),
-            showlegend=False,
-            height=400,
-            margin=dict(l=60, r=60, t=40, b=40),
-            dragmode=False
-        )
-        st.plotly_chart(fig_radar, use_container_width=True, config={'staticPlot': True})
-
-    # 2. 配当推移グラフと利回りの補正
-    with col2:
-        st.write("💰 配当金の推移 (10年)")
-        try:
-            stock = yf.Ticker(ticker)
-            divs = stock.dividends
-                    
-        # --- 2. 配当推移グラフ（Plotly版）の修正 ---
-        # st.bar_chart ではなく Plotly を使うことで詳細な制御が可能になります
-            if not divs.empty:
-                yearly_divs = divs.resample("YE").sum().tail(10)
-                fig_div = go.Figure(data=[go.Bar(
-                    x=yearly_divs.index.year, 
-                    y=yearly_divs.values,
-                    marker_color='#1f77b4',
-                    hovertemplate='西暦: %{x}<br>配当金: %{y}円<extra></extra>' # チップをカスタマイズ
-                )])
-                fig_div.update_layout(
-                    height=300,
-                    margin=dict(l=20, r=20, t=20, b=20),
-                    dragmode=False, # 移動禁止
-                    xaxis=dict(fixedrange=True), # X軸のズーム禁止
-                    yaxis=dict(fixedrange=True), # Y軸のズーム禁止
-                )
-                st.plotly_chart(
-                    fig_div, 
-                    width='stretch', 
-                    config={'displayModeBar': False} # ツールバーを隠してスッキリさせる
-                )
-                    
-                # 利回りの計算を厳格化 (700%などの異常値対策)
-                info = stock.info
-                raw_yield = info.get('dividendYield')
-                
-                if raw_yield is not None:
-                    # 1.0(100%)を超える場合は、すでに100掛けされていると判断して補正
-                    actual_yield = raw_yield if raw_yield < 1.0 else raw_yield / 100
-                    display_yield = actual_yield * 100
-                    
-                    # 万が一、補正後も30%を超えるようなら「異常値」として警告表示
-                    if display_yield > 30:
-                        st.metric("予想配当利回り", "データ異常", delta=f"{display_yield:.1f}% ?", delta_color="inverse")
-                    else:
-                        st.metric("予想配当利回り", f"{display_yield:.2f} %")
-                else:
-                    st.metric("予想配当利回り", "--- %")
-            else:
-                st.info("配当データが見つかりませんでした。")
-        except:
-            st.error("データの取得に失敗しました。")
-# 3. 指標スコア詳細テーブル (チャートの順番と一致させる)
-    st.write("📝 評価指標スコア詳細")
-    table_data = []
-    for k in fixed_keys:
-        score_val = raw_scores.get(k, 0)
-        # 点数に応じて絵文字を付与
-        status = "✅" if score_val >= 8 else "◯" if score_val >= 6 else "△"
-        table_data.append({
-            "判定": status,
-            "評価項目": k,
-            "獲得点数": f"{score_val} / 10"
-        })
-    
-    st.table(pd.DataFrame(table_data))
-
-# --- 最後にこれを呼び出す ---
-ranking_board()
+    # 点数計算前の実際の数値も再計算して表示
+    raw_total, raw_values = calculate_score_raw(ticker)
+    st.metric("総合スコア", f"{total} / 100")
+    df_scores = pd.DataFrame(scores.items(), columns=["指標","点数"])
+    df_raw = pd.DataFrame(raw_values.items(), columns=["指標","実際の値"])
+    st.dataframe(df_scores, use_container_width=True)
+    st.dataframe(df_raw, use_container_width=True)
+    categories = list(scores.keys())
+    values = list(scores.values())
+    fig = go.Figure()
+    fig.add_trace(go.Scatterpolar(
+        r=values + [values[0]],
+        theta=categories + [categories[0]],
+        fill='toself'
+    ))
+    fig.update_layout(
+        polar=dict(radialaxis=dict(visible=True, range=[0,10])),
+        showlegend=False
+    )
+    st.plotly_chart(fig, use_container_width=True)
+# 点数計算前の実際の数値を返す関数を追加
+def calculate_score_raw(code):
+    stock = yf.Ticker(code)
+    info = stock.info
+    dividends = stock.dividends
+    income_stmt = stock.income_stmt
+    balance = stock.balance_sheet
+    yearly_div = dividends.resample("YE").sum() if not dividends.empty else pd.Series()
+    growth_years = 0
+    for i in range(1, len(yearly_div)):
+        if yearly_div.iloc[i] > yearly_div.iloc[i-1]:
+            growth_years += 1
+    div_cagr = cagr(yearly_div)
+    payout = (info.get("payoutRatio") or 0) * 100
+    net_income_series = income_stmt.loc["Net Income"] if "Net Income" in income_stmt.index else pd.Series()
+    eps_cagr = cagr(net_income_series)
+    roe = (info.get("returnOnEquity") or 0) * 100
+    retained = balance.loc["Retained Earnings"][0] if "Retained Earnings" in balance.index else 0
+    annual_div = yearly_div.iloc[0] if len(yearly_div) > 0 else 1
+    sustain = retained / annual_div if annual_div > 0 else 0
+    revenue_series = income_stmt.loc["Total Revenue"] if "Total Revenue" in income_stmt.index else pd.Series()
+    revenue_cagr = cagr(revenue_series)
+    if "Operating Income" in income_stmt.index and "Total Revenue" in income_stmt.index:
+        op_income = income_stmt.loc["Operating Income"]
+        total_revenue = income_stmt.loc["Total Revenue"]
+        op_margin = (op_income.iloc[0] / total_revenue.iloc[0]) * 100 if total_revenue.iloc[0] != 0 else None
+    else:
+        op_margin = None
+    market_cap = info.get("marketCap", 0)
+    cash = balance.loc["Cash And Cash Equivalents"][0] if "Cash And Cash Equivalents" in balance.index else 0
+    net_income = net_income_series.iloc[0] if len(net_income_series) > 0 else 1
+    cn_per = (market_cap - cash) / net_income if net_income != 0 else 999
+    dividend_yield_raw = info.get("dividendYield")
+    if dividend_yield_raw is not None and dividend_yield_raw > 0:
+        if dividend_yield_raw < 1:
+            dividend_yield = dividend_yield_raw * 100
+        else:
+            dividend_yield = dividend_yield_raw
+    else:
+        if len(yearly_div) > 0 and "regularMarketPrice" in info and info["regularMarketPrice"]:
+            dividend_yield = (yearly_div.iloc[0] / info["regularMarketPrice"]) * 100
+        else:
+            dividend_yield = None
+    raw_values = {
+        "連続増配年数": growth_years,
+        "5年配当CAGR": div_cagr,
+        "予想配当性向": 60-payout,
+        "純利益5年CAGR": eps_cagr,
+        "ROE": roe,
+        "配当維持可能年数": sustain,
+        "売上5年CAGR": revenue_cagr,
+        "営業利益率": op_margin,
+        "CN-PER": 30-cn_per,
+        "配当利回り": dividend_yield
+    }
+    total = sum([v for v in raw_values.values() if isinstance(v, (int, float))])
+    return total, raw_values
