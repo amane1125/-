@@ -248,12 +248,11 @@ def ranking_board():
 def show_details(ticker, row_data):
     st.divider()
     name = master.get(ticker, {}).get('name', '不明')
-    sector = master.get(ticker, {}).get('sector', '不明')
     st.subheader(f"🔍 {name} ({ticker}) の詳細分析")
     
     col1, col2 = st.columns([1, 1])
     
-    # 1. レーダーチャート (点数配分)
+    # 1. レーダーチャート (操作無効化設定)
     with col1:
         st.write("📈 指標別スコア")
         scores = json.loads(row_data['score_json'])
@@ -270,37 +269,50 @@ def show_details(ticker, row_data):
             polar=dict(radialaxis=dict(visible=True, range=[0, 10])),
             showlegend=False,
             height=400,
-            margin=dict(l=40, r=40, t=20, b=20)
+            # configで「変形・操作」を禁止するため、ここでは最小限の余白設定
+            margin=dict(l=40, r=40, t=40, b=40),
+            dragmode=False # ドラッグによる移動・変形を禁止
         )
-# 警告箇所: width='stretch' を使用
-        st.plotly_chart(fig_radar, width='stretch')
+        # config={'staticPlot': True} を指定すると、一切のズーム・変形ができなくなります
+        st.plotly_chart(fig_radar, width='stretch', config={'staticPlot': True})
 
-    # 2. 配当推移グラフ
+    # 2. 配当推移グラフと利回りの補正
     with col2:
-        st.write("💰 配当金の推移 (年単位)")
+        st.write("💰 配当金の推移 (10年)")
         try:
             stock = yf.Ticker(ticker)
-            # 過去10年分の配当を取得
             divs = stock.dividends
             if not divs.empty:
-# 警告箇所: ilocを使用して安全にアクセス
                 yearly_divs = divs.resample("YE").sum().tail(10)
                 yearly_divs.index = yearly_divs.index.year
-
-                # 棒グラフを表示
+                
+                # 棒グラフ (Streamlitの標準チャートはシンプルで固定的なのでそのまま)
                 st.bar_chart(yearly_divs, width='stretch')
                 
-                # 利回りなどの指標
+                # 利回りの計算を厳格化 (700%などの異常値対策)
                 info = stock.info
-                st.metric("予想配当利回り", f"{info.get('dividendYield', 0)*100:.2f} %")
+                raw_yield = info.get('dividendYield')
+                
+                if raw_yield is not None:
+                    # 1.0(100%)を超える場合は、すでに100掛けされていると判断して補正
+                    actual_yield = raw_yield if raw_yield < 1.0 else raw_yield / 100
+                    display_yield = actual_yield * 100
+                    
+                    # 万が一、補正後も30%を超えるようなら「異常値」として警告表示
+                    if display_yield > 30:
+                        st.metric("予想配当利回り", "データ異常", delta=f"{display_yield:.1f}% ?", delta_color="inverse")
+                    else:
+                        st.metric("予想配当利回り", f"{display_yield:.2f} %")
+                else:
+                    st.metric("予想配当利回り", "--- %")
             else:
                 st.info("配当データが見つかりませんでした。")
         except:
-            st.error("配当データの取得に失敗しました。")
+            st.error("データの取得に失敗しました。")
 
-    # 3. 指標データテーブル
-    st.write("📝 評価指標データ")
-    st.table(pd.DataFrame(scores.items(), columns=["評価項目", "獲得点数 (10点満点)"]))
+    # 3. 指標データ
+    st.write("📝 評価指標スコア詳細")
+    st.table(pd.DataFrame(scores.items(), columns=["評価項目", "獲得点数"]))
 
 # --- 最後にこれを呼び出す ---
 ranking_board()
