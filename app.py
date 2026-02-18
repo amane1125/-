@@ -2,18 +2,19 @@ import streamlit as st
 import pandas as pd
 import yfinance as yf
 from io import BytesIO
-import requests
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 import sqlite3
-import time
-import plotly.graph_objects as go
+import json
 import os
+import plotly.graph_objects as go
 
 st.set_page_config(page_title="Dividend Growth 100", layout="wide")
 st.title("🇯🇵 Dividend Growth 100")
 st.write("増配企業を100点満点で評価します")
 
 DB_PATH = "stock_data.db"
+JPX_FILE = "jpx_list.xls"
 
 # ------------------------
 # 共通関数
@@ -37,14 +38,13 @@ def score(value, thresholds):
     return 2
 
 # ------------------------
-# JPX Excelから全銘柄取得
+# JPX Excel取得
 # ------------------------
 def get_all_tickers():
-    url = "https://www.jpx.co.jp/markets/statistics-equities/misc/tvdivq0000001vg2-att/data_j.xls"
-    headers = {"User-Agent": "Mozilla/5.0"}
-    response = requests.get(url, headers=headers)
-    response.raise_for_status()
-    df = pd.read_excel(BytesIO(response.content))
+    if not os.path.exists(JPX_FILE):
+        url = "https://www.jpx.co.jp/markets/statistics-equities/misc/tvdivq0000001vg2-att/data_j.xls"
+        urllib.request.urlretrieve(url, JPX_FILE)
+    df = pd.read_excel(JPX_FILE)
     df = df[df["市場・商品区分"].str.contains("内国株式", na=False)]
     tickers = df["コード"].astype(str) + ".T"
     return set(tickers)
@@ -77,6 +77,7 @@ def calculate_score(code):
 
     yearly_div = dividends.resample("YE").sum() if not dividends.empty else pd.Series()
 
+    # 連続増配年数
     growth_years = 0
     for i in range(1, len(yearly_div)):
         if yearly_div.iloc[i] > yearly_div.iloc[i-1]:
@@ -123,7 +124,6 @@ def calculate_score(code):
 def fetch_and_cache(ticker, conn):
     try:
         total, scores = calculate_score(ticker)
-        import json
         c = conn.cursor()
         c.execute('''INSERT OR REPLACE INTO stocks (ticker, total_score, score_json, last_update)
                      VALUES (?, ?, ?, CURRENT_TIMESTAMP)''',
@@ -164,13 +164,11 @@ with ThreadPoolExecutor(max_workers=5) as executor:
 st.header("📊 ランキング分析")
 cur.execute("SELECT * FROM stocks")
 rows = cur.fetchall()
-import json
-columns = ["ticker","総合点","score_json","last_update"]
-df = pd.DataFrame(rows, columns=columns)
+df = pd.DataFrame(rows, columns=["ticker","総合点","score_json","last_update"])
 df["score_json"] = df["score_json"].apply(json.loads)
 df["総合点"] = df["総合点"].astype(int)
 sorted_df = df.sort_values("総合点", ascending=False)
-st.dataframe(sorted_df[["ticker","総合点"]], use_container_width=True)
+st.dataframe(sorted_df[["ticker","総合点"]], width='stretch')
 
 # ------------------------
 # 個別銘柄分析
@@ -188,7 +186,7 @@ if ticker_input:
         total, scores = calculate_score(ticker)
     st.metric("総合スコア", f"{total} / 100")
     df_scores = pd.DataFrame(scores.items(), columns=["指標","点数"])
-    st.dataframe(df_scores, use_container_width=True)
+    st.dataframe(df_scores, width='stretch')
     categories = list(scores.keys())
     values = list(scores.values())
     fig = go.Figure()
@@ -201,4 +199,4 @@ if ticker_input:
         polar=dict(radialaxis=dict(visible=True, range=[0,10])),
         showlegend=False
     )
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width=800)
