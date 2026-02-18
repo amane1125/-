@@ -1,4 +1,6 @@
+import requests
 import pandas as pd
+from io import BytesIO
 import yfinance as yf
 from concurrent.futures import ThreadPoolExecutor
 import os
@@ -8,15 +10,21 @@ import os
 # =========================
 def get_all_tickers():
     url = "https://www.jpx.co.jp/markets/statistics-equities/misc/tvdivq0000001vg2-att/data_j.csv"
-    
-    df = pd.read_csv(url, encoding="shift_jis")
+
+    headers = {
+        "User-Agent": "Mozilla/5.0"
+    }
+
+    response = requests.get(url, headers=headers)
+    response.raise_for_status()  # HTTPエラーなら止める
+
+    df = pd.read_csv(BytesIO(response.content), encoding="shift_jis")
+
     df = df[df["市場・商品区分"].str.contains("内国株式", na=False)]
-    
+
     tickers = df["コード"].astype(str) + ".T"
+
     return set(tickers)
-
-
-
 # =========================
 # ② 個別銘柄取得
 # =========================
