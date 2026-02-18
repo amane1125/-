@@ -292,29 +292,51 @@ def show_details(ticker, row_data):
     
     col1, col2 = st.columns([1, 1])
     
-    # 1. レーダーチャート (操作無効化設定)
+    # 指標の並び順を定義（12時方向から時計回り）
+    fixed_keys = [
+        "連続増配年数", "5年配当CAGR", "純利益5年CAGR", "売上5年CAGR",
+        "ROE", "営業利益率", "配当利回り", "予想配当性向"
+    ]
+    
+    # JSONからスコアを取得
+    raw_scores = json.loads(row_data['score_json'])
+    
+    # 1. 順序を固定したリストを作成
+    categories = fixed_keys
+    values = [raw_scores.get(k, 0) for k in categories]
+    
+# 1. レーダーチャート
     with col1:
         st.write("📈 指標別スコア")
-        scores = json.loads(row_data['score_json'])
-        categories = list(scores.keys())
-        values = list(scores.values())
         
         fig_radar = go.Figure(data=go.Scatterpolar(
             r=values + [values[0]],
             theta=categories + [categories[0]],
             fill='toself',
+            fillcolor='rgba(31, 119, 180, 0.4)',
             line_color='#1f77b4'
         ))
+        
         fig_radar.update_layout(
-            polar=dict(radialaxis=dict(visible=True, range=[0, 10])),
+            polar=dict(
+                radialaxis=dict(
+                    visible=True, 
+                    range=[0, 10],
+                    tickfont=dict(size=10),
+                    gridcolor="lightgrey"
+                ),
+                angularaxis=dict(
+                    direction="clockwise", # 時計回りに設定
+                    period=len(categories),
+                    gridcolor="lightgrey"
+                )
+            ),
             showlegend=False,
             height=400,
-            # configで「変形・操作」を禁止するため、ここでは最小限の余白設定
-            margin=dict(l=40, r=40, t=40, b=40),
-            dragmode=False # ドラッグによる移動・変形を禁止
+            margin=dict(l=60, r=60, t=40, b=40),
+            dragmode=False
         )
-        # config={'staticPlot': True} を指定すると、一切のズーム・変形ができなくなります
-        st.plotly_chart(fig_radar, width='stretch', config={'staticPlot': True})
+        st.plotly_chart(fig_radar, use_container_width=True, config={'staticPlot': True})
 
     # 2. 配当推移グラフと利回りの補正
     with col2:
@@ -366,10 +388,20 @@ def show_details(ticker, row_data):
                 st.info("配当データが見つかりませんでした。")
         except:
             st.error("データの取得に失敗しました。")
-
-    # 3. 指標データ
+# 3. 指標スコア詳細テーブル (チャートの順番と一致させる)
     st.write("📝 評価指標スコア詳細")
-    st.table(pd.DataFrame(scores.items(), columns=["評価項目", "獲得点数"]))
+    table_data = []
+    for k in fixed_keys:
+        score_val = raw_scores.get(k, 0)
+        # 点数に応じて絵文字を付与
+        status = "✅" if score_val >= 8 else "◯" if score_val >= 6 else "△"
+        table_data.append({
+            "判定": status,
+            "評価項目": k,
+            "獲得点数": f"{score_val} / 10"
+        })
+    
+    st.table(pd.DataFrame(table_data))
 
 # --- 最後にこれを呼び出す ---
 ranking_board()
