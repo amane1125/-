@@ -10,17 +10,15 @@ st.write("増配企業を100点満点で評価します")
 
 ticker_input = st.text_input("銘柄コード（例: 9432）")
 
-def safe_get(df, key):
+def cagr(series):
     try:
-        return df.loc[key][0]
-    except:
-        return 0
-
-def cagr(start, end, years):
-    try:
-        if start > 0 and years > 0:
-            return ((end/start)**(1/years)-1)*100
-        return 0
+        if len(series) < 5:
+            return 0
+        start = series.iloc[-5]
+        end = series.iloc[0]
+        if start <= 0:
+            return 0
+        return ((end/start)**(1/5)-1)*100
     except:
         return 0
 
@@ -36,59 +34,50 @@ if ticker_input:
     try:
         stock = yf.Ticker(ticker)
         info = stock.info
+
         dividends = stock.dividends
-        financials = stock.financials
-        earnings = stock.earnings
+        income_stmt = stock.income_stmt
         balance = stock.balance_sheet
 
-        # -------- 配当データ --------
-        yearly_div = dividends.resample("Y").sum() if not dividends.empty else pd.Series()
+        # ---------------- 配当 ----------------
+        yearly_div = dividends.resample("YE").sum() if not dividends.empty else pd.Series()
 
         growth_years = 0
         for i in range(1, len(yearly_div)):
             if yearly_div.iloc[i] > yearly_div.iloc[i-1]:
                 growth_years += 1
 
-        div_cagr = cagr(
-            yearly_div.iloc[-5] if len(yearly_div)>=5 else 0,
-            yearly_div.iloc[-1] if len(yearly_div)>=1 else 0,
-            5
-        )
+        div_cagr = cagr(yearly_div)
 
-        payout = (info.get("payoutRatio") or 0)*100
+        payout = (info.get("payoutRatio") or 0) * 100
 
-        eps_cagr = cagr(
-            earnings["Earnings"].iloc[0] if len(earnings)>=5 else 0,
-            earnings["Earnings"].iloc[-1] if len(earnings)>=5 else 0,
-            5
-        )
+        # ---------------- EPS代替（純利益） ----------------
+        net_income_series = income_stmt.loc["Net Income"] if "Net Income" in income_stmt.index else pd.Series()
+        eps_cagr = cagr(net_income_series)
 
-        roe = (info.get("returnOnEquity") or 0)*100
+        roe = (info.get("returnOnEquity") or 0) * 100
 
-        retained = safe_get(balance, "Retained Earnings")
-        annual_div = yearly_div.iloc[-1] if len(yearly_div)>0 else 1
+        retained = balance.loc["Retained Earnings"][0] if "Retained Earnings" in balance.index else 0
+        annual_div = yearly_div.iloc[0] if len(yearly_div)>0 else 1
         sustain = retained/annual_div if annual_div>0 else 0
 
-        revenue_cagr = cagr(
-            safe_get(financials, "Total Revenue"),
-            safe_get(financials, "Total Revenue"),
-            5
-        )
+        revenue_series = income_stmt.loc["Total Revenue"] if "Total Revenue" in income_stmt.index else pd.Series()
+        revenue_cagr = cagr(revenue_series)
 
-        op_margin = (info.get("operatingMargins") or 0)*100
+        op_margin = (info.get("operatingMargins") or 0) * 100
 
         market_cap = info.get("marketCap",0)
-        cash = safe_get(balance,"Cash And Cash Equivalents")
-        net_income = safe_get(financials,"Net Income")
-        cn_per = (market_cap-cash)/net_income if net_income!=0 else 999
+        cash = balance.loc["Cash And Cash Equivalents"][0] if "Cash And Cash Equivalents" in balance.index else 0
+        net_income = net_income_series.iloc[0] if len(net_income_series)>0 else 1
+        cn_per = (market_cap - cash) / net_income if net_income != 0 else 999
 
-        dividend_yield = (info.get("dividendYield") or 0)*100
+        dividend_yield = (info.get("dividendYield") or 0) * 100
 
         scores = {
             "連続増配年数": score(growth_years, [(10,10),(8,5),(6,3)]),
             "5年配当CAGR": score(div_cagr, [(10,15),(8,10),(6,5)]),
             "予想配当性向": score(60-payout, [(10,20),(8,10),(6,0)]),
-            "EPS5年CAGR": score(eps_cagr, [(10,15),(8,10),(6,5)]),
+            "純利益5年CAGR": score(eps_cagr, [(10,15),(8,10),(6,5)]),
             "ROE": score(roe, [(10,20),(8,15),(6,10)]),
             "配当維持可能年数": score(sustain, [(10,10),(8,5),(6,3)]),
             "売上5年CAGR": score(revenue_cagr, [(10,10),(8,5),(6,3)]),
